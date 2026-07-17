@@ -1,13 +1,17 @@
 name: 'Landsafe — Postgres migration safety'
-description: >-
-  Catch dangerous Postgres migrations before they land. Lock analysis, plain-English
-  impact, and zero-downtime rewrites — as a sticky comment on every PR. Postgres-only v1.
+description: 'Catches the Postgres migration that takes production down — in the PR, before it merges.'
 author: 'Landsafe'
 branding:
   icon: 'shield'
   color: 'green'
 
 inputs:
+  mode:
+    description: >-
+      'review' (default) analyzes the migrations in a PR and posts the sticky comment.
+      'digest' produces the weekly cross-repo report instead — see the digest-* inputs.
+    required: false
+    default: 'review'
   paths:
     description: >-
       Multiline glob patterns for SQL migration files (supports **, *, ?).
@@ -56,19 +60,71 @@ inputs:
     required: false
     default: 'https://landsafe.dev/#pricing'
   github-token:
-    description: 'Token used to list changed PR files and post the comment.'
+    description: >-
+      Token used to list changed PR files and post the comment. In digest mode it also
+      reads pull requests and their comments across the org, so it needs read access to
+      every repo you want covered (the default github.token only sees the current repo —
+      use a PAT or GitHub App token for a cross-repo digest).
     required: false
     default: ${{ github.token }}
 
+  # --- Digest mode (Landsafe Business) -------------------------------------
+  # The digest reads the reports Landsafe already wrote into your own PR comments,
+  # through your own token. Nothing is sent to Landsafe. Run it on a schedule:
+  #
+  #   name: Landsafe weekly digest
+  #   on:
+  #     schedule:
+  #       - cron: '0 14 * * 1'   # Mondays, 14:00 UTC
+  #     workflow_dispatch:
+  #   jobs:
+  #     digest:
+  #       runs-on: ubuntu-latest
+  #       steps:
+  #         - uses: landsafe/landsafe-action@v1
+  #           with:
+  #             mode: digest
+  #             license: ${{ secrets.LANDSAFE_LICENSE }}
+  #             github-token: ${{ secrets.LANDSAFE_DIGEST_TOKEN }}
+  #             digest-since-days: '7'
+  #             digest-webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+  #
+  # Digest mode never fails the run on findings — it is a report, not a gate.
+  digest-since-days:
+    description: 'Digest mode: how many days back to cover.'
+    required: false
+    default: '7'
+  digest-repos:
+    description: >-
+      Digest mode: multiline list of "owner/repo" to cover. If empty, every repo in the
+      current org that the token can see is used (falling back to just this repo).
+    required: false
+    default: ''
+  digest-webhook:
+    description: >-
+      Digest mode: optional Slack-compatible webhook URL. The digest is POSTed as
+      {"text": "<markdown>"}. A failed POST is a warning, never a failed run. The digest
+      is always written to the job summary regardless.
+    required: false
+    default: ''
+  digest-dashboard-url:
+    description: 'Digest mode: optional URL to link from the digest ("open the dashboard").'
+    required: false
+    default: ''
+
 outputs:
   critical:
-    description: 'Number of critical findings.'
+    description: 'Number of critical findings (digest mode: across the whole window).'
   warning:
-    description: 'Number of warning findings.'
+    description: 'Number of warning findings (digest mode: across the whole window).'
   info:
-    description: 'Number of info findings.'
+    description: 'Number of info findings (digest mode: across the whole window).'
   verdict:
-    description: "Overall verdict: 'ok', 'attention', or 'danger'."
+    description: "Review mode only. Overall verdict: 'ok', 'attention', or 'danger'."
+  prs-analyzed:
+    description: 'Digest mode only. PRs in the window carrying a Landsafe report.'
+  repos-covered:
+    description: 'Digest mode only. Repos with at least one analyzed PR in the window.'
 
 runs:
   using: 'node24'

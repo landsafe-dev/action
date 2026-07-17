@@ -7,19 +7,37 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as core from '@actions/core';
 import * as github from '@actions/github';
-import { analyzeFiles, renderMarkdown, COMMENT_MARKER, type FileInput, type Report } from '@landsafe/engine';
+import {
+  analyzeFiles,
+  buildDigest,
+  renderDigestMarkdown,
+  renderMarkdown,
+  COMMENT_MARKER,
+  type FileInput,
+  type Report,
+} from '@landsafe/engine';
 import {
   parsePatterns,
   resolveFiles,
   walkFiles,
   decideFailure,
   resolveLicense,
+  resolveFailOn,
+  parseMode,
   parseSnapshot,
   resolveProUrl,
   upsertCommentSafely,
   frameworkNote,
+  digestLicensed,
+  digestWindow,
+  resolveDigestRepos,
+  collectDigestPrs,
+  postDigestWebhook,
   type CommentDeps,
+  type DigestDeps,
+  type DigestPull,
   type FailOn,
+  type ResolvedLicense,
 } from './lib.js';
 
 type Octokit = ReturnType<typeof github.getOctokit>;
@@ -43,6 +61,97 @@ function octokitCommentDeps(octokit: Octokit, owner: string, repo: string): Comm
   };
 }
 
+function splitRepo(full: string): { owner: string; repo: string } {
+  const [owner = '', repo = ''] = full.split('/');
+  return { owner, repo };
+}
+
+function octokitDigestDeps(octokit: Octokit): DigestDeps {
+  return {
+    // One page at a time — collectRepoPulls stops at the window edge, so we must
+    // not hand it an eager paginate() that would walk the repo's full history.
+    async listPullsPage(full, page, perPage) {
+      const { owner, repo } = splitRepo(full);
+      const res = await octokit.rest.pulls.list({
+        owner,
+        repo,
+        state: 'all',
+        sort: 'updated',
+        direction: 'desc',
+        per_page: perPage,
+        page,
+      });
+      return res.data as DigestPull[];
+    },
+    async listIssueComments(full, issueNumber) {
+      const { owner, repo } = splitRepo(full);
+      return octokit.paginate(octokit.rest.issues.listComments, {
+        owner,
+        repo,
+        issue_number: issueNumber,
+        per_page: 100,
+      });
+    },
+    async listOrgRepos(org) {
+      const repos = await octokit.paginate(octokit.rest.repos.listForOrg, { org, per_page: 100 });
+      return repos.map((r) => r.full_name);
+    },
+  };
+}
+
+/**
+ * Digest mode: aggregate the payloads Landsafe already wrote into the customer's
+ * own PR comments, read with the customer's own token. Never fails the run on
+ * findings — it is a report, not a gate.
+ */
+async function runDigest(octokit: Octokit | undefined, license: ResolvedLicense): Promise<void> {
+  const licensed = digestLicensed(license);
+  if (!licensed.ok) {
+    core.setFailed(licensed.message ?? 'Digest requires Landsafe Business.');
+    return;
+  }
+  if (!octokit) {
+    core.setFailed('Digest mode needs a github-token with read access to your repos and their pull requests.');
+    return;
+  }
+
+  const { owner, repo } = github.context.repo;
+  const currentRepo = `${owner}/${repo}`;
+  const { since, until } = digestWindow(core.getInput('digest-since-days'));
+  const dashboardUrl = core.getInput('digest-dashboard-url').trim();
+  const webhook = core.getInput('digest-webhook').trim();
+
+  const deps = octokitDigestDeps(octokit);
+  const repos = await resolveDigestRepos(deps, core.getInput('digest-repos'), owner, currentRepo, (m) => core.warning(m));
+  core.info(`Digest window ${since} → ${until} across ${repos.length} repo(s).`);
+
+  const { prs, unreadable } = await collectDigestPrs(deps, repos, new Date(since), new Date(until), (m) => core.warning(m));
+  core.info(`Found ${prs.length} PR(s) carrying a Landsafe report.`);
+
+  const report = buildDigest(prs, { since, until, org: owner, unreadable });
+  const markdown = renderDigestMarkdown(report, dashboardUrl ? { dashboardUrl } : {});
+
+  try {
+    await core.summary.addRaw(markdown).write();
+  } catch (err) {
+    core.debug(`Could not write job summary: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (webhook) {
+    const ok = await postDigestWebhook(webhook, markdown, (m) => core.warning(m));
+    if (ok) core.info('Digest posted to the webhook.');
+  }
+
+  core.setOutput('critical', String(report.totals.critical));
+  core.setOutput('warning', String(report.totals.warning));
+  core.setOutput('info', String(report.totals.info));
+  core.setOutput('prs-analyzed', String(report.prsAnalyzed));
+  core.setOutput('repos-covered', String(report.reposCovered));
+  core.info(
+    `Digest: ${report.prsAnalyzed} PR(s), ${report.reposCovered} repo(s), ${report.mergedWithCritical.length} merged with unresolved criticals.`,
+  );
+}
+
 async function changedFilesFromPR(octokit: Octokit): Promise<string[]> {
   const { owner, repo } = github.context.repo;
   const pullNumber = github.context.issue.number;
@@ -59,8 +168,9 @@ async function changedFilesFromPR(octokit: Octokit): Promise<string[]> {
 
 async function run(): Promise<void> {
   const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+  const mode = parseMode(core.getInput('mode'));
   const patterns = parsePatterns(core.getInput('paths'));
-  const failOn = ((core.getInput('fail-on') || 'critical').trim() as FailOn);
+  const localFailOn = ((core.getInput('fail-on') || 'critical').trim() as FailOn);
   const pgVersion = Number.parseInt(core.getInput('pg-version') || '15', 10) || 15;
   const assumeTransaction = (core.getInput('assume-transaction') || 'true').trim() !== 'false';
   const snapshotPath = core.getInput('snapshot').trim();
@@ -69,14 +179,24 @@ async function run(): Promise<void> {
   const proUrl = resolveProUrl(core.getInput('pro-url'));
   const token = core.getInput('github-token') || process.env.GITHUB_TOKEN || '';
 
-  if (!['critical', 'warning', 'never'].includes(failOn)) {
-    throw new Error(`Invalid fail-on value "${failOn}" — use 'critical', 'warning', or 'never'.`);
+  if (!['critical', 'warning', 'never'].includes(localFailOn)) {
+    throw new Error(`Invalid fail-on value "${localFailOn}" — use 'critical', 'warning', or 'never'.`);
   }
 
   // --- License (Pro) ---
   const license = resolveLicense(licenseKey || undefined);
   if (license.warning) core.warning(license.warning);
   if (license.pro) core.info('Landsafe Pro license verified.');
+
+  const octokitEarly = token ? github.getOctokit(token) : undefined;
+  if (mode === 'digest') {
+    await runDigest(octokitEarly, license);
+    return;
+  }
+
+  // --- Org policy: a signed policy can tighten this repo's threshold, never loosen it. ---
+  const { failOn, message: policyNote } = resolveFailOn(localFailOn, license.payload);
+  if (policyNote) core.info(policyNote);
 
   // --- Snapshot (Pro impact numbers) ---
   let snapshot;
@@ -95,7 +215,7 @@ async function run(): Promise<void> {
   // --- Changed files ---
   const eventName = github.context.eventName;
   const isPR = eventName === 'pull_request' || eventName === 'pull_request_target';
-  const octokit = token ? github.getOctokit(token) : undefined;
+  const octokit = octokitEarly;
 
   let candidates: string[];
   if (isPR && octokit) {

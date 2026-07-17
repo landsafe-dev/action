@@ -13046,7 +13046,7 @@ var require_fetch = __commonJS({
         this.emit("terminated", error);
       }
     };
-    function fetch(input, init = {}) {
+    function fetch2(input, init = {}) {
       webidl.argumentLengthCheck(arguments, 1, { header: "globalThis.fetch" });
       const p = createDeferredPromise();
       let requestObject;
@@ -13976,7 +13976,7 @@ var require_fetch = __commonJS({
       }
     }
     module2.exports = {
-      fetch,
+      fetch: fetch2,
       Fetch,
       fetching,
       finalizeAndReportTiming
@@ -14370,7 +14370,7 @@ var require_util4 = __commonJS({
     var { serializeAMimeType, parseMIMEType } = require_dataURL();
     var { types } = require("util");
     var { StringDecoder } = require("string_decoder");
-    var { btoa } = require("buffer");
+    var { btoa: btoa2 } = require("buffer");
     var staticPropertyDescriptors = {
       enumerable: true,
       writable: false,
@@ -14462,9 +14462,9 @@ var require_util4 = __commonJS({
           dataURL += ";base64,";
           const decoder = new StringDecoder("latin1");
           for (const chunk of bytes) {
-            dataURL += btoa(decoder.write(chunk));
+            dataURL += btoa2(decoder.write(chunk));
           }
-          dataURL += btoa(decoder.end());
+          dataURL += btoa2(decoder.end());
           return dataURL;
         }
         case "Text": {
@@ -17232,7 +17232,7 @@ var require_undici = __commonJS({
     module2.exports.getGlobalDispatcher = getGlobalDispatcher;
     if (util.nodeMajor > 16 || util.nodeMajor === 16 && util.nodeMinor >= 8) {
       let fetchImpl = null;
-      module2.exports.fetch = async function fetch(resource) {
+      module2.exports.fetch = async function fetch2(resource) {
         if (!fetchImpl) {
           fetchImpl = require_fetch().fetch;
         }
@@ -20708,16 +20708,16 @@ var require_dist_node5 = __commonJS({
       let headers = {};
       let status;
       let url;
-      let { fetch } = globalThis;
+      let { fetch: fetch2 } = globalThis;
       if ((_b = requestOptions.request) == null ? void 0 : _b.fetch) {
-        fetch = requestOptions.request.fetch;
+        fetch2 = requestOptions.request.fetch;
       }
-      if (!fetch) {
+      if (!fetch2) {
         throw new Error(
           "fetch is not set. Please pass a fetch implementation as new Octokit({ request: { fetch }}). Learn more at https://github.com/octokit/octokit.js/#fetch-missing"
         );
       }
-      return fetch(requestOptions.url, {
+      return fetch2(requestOptions.url, {
         method: requestOptions.method,
         body: requestOptions.body,
         redirect: (_c = requestOptions.request) == null ? void 0 : _c.redirect,
@@ -25925,6 +25925,66 @@ function excerpt(text) {
   return first.length > 120 ? first.slice(0, 117) + "\u2026" : first;
 }
 
+// packages/engine/src/payload.ts
+var PAYLOAD_PREFIX = "<!-- landsafe-data:";
+var PAYLOAD_SUFFIX = " -->";
+var MAX_PAYLOAD_FINDINGS = 100;
+function b64urlEncode(s) {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  const b64 = typeof btoa === "function" ? btoa(bin) : Buffer.from(s, "utf8").toString("base64");
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64urlDecode(s) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  if (typeof atob === "function") {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+  return Buffer.from(b64, "base64").toString("utf8");
+}
+function buildPayload(report, now) {
+  const findings = report.findings.slice(0, MAX_PAYLOAD_FINDINGS).map((f) => {
+    const p = { r: f.ruleId, s: f.severity, f: f.file, l: f.line };
+    if (f.table) p.t = f.table;
+    return p;
+  });
+  const payload = {
+    v: 1,
+    ts: now.toISOString(),
+    e: report.engineVersion,
+    pro: report.pro,
+    verdict: report.verdict,
+    counts: report.counts,
+    files: report.filesAnalyzed,
+    stmts: report.statementsAnalyzed,
+    findings
+  };
+  if (report.findings.length > findings.length) payload.capped = true;
+  return payload;
+}
+function encodePayload(payload) {
+  return `${PAYLOAD_PREFIX}${b64urlEncode(JSON.stringify(payload))}${PAYLOAD_SUFFIX}`;
+}
+function extractPayload(commentBody) {
+  const start = commentBody.indexOf(PAYLOAD_PREFIX);
+  if (start === -1) return void 0;
+  const from = start + PAYLOAD_PREFIX.length;
+  const end = commentBody.indexOf("-->", from);
+  if (end === -1) return void 0;
+  const raw = commentBody.slice(from, end).trim();
+  try {
+    const parsed = JSON.parse(b64urlDecode(raw));
+    if (parsed && parsed.v === 1 && parsed.counts && Array.isArray(parsed.findings)) return parsed;
+    return void 0;
+  } catch {
+    return void 0;
+  }
+}
+
 // packages/engine/src/render/markdown.ts
 var COMMENT_MARKER = "<!-- landsafe-comment -->";
 var BODY_BUDGET = 58e3;
@@ -25951,11 +26011,12 @@ function renderMarkdown(report, opts = {}) {
       F.push(
         "---",
         "",
-        `**\u{1F513} Landsafe Pro** \u2014 every finding above becomes a ready-to-paste zero-downtime migration, with lock-impact estimated against your real table sizes (from a stats-only snapshot \u2014 never row data). [Unlock Pro \u2192](${proUrl}) \xB7 $79/repo/mo \xB7 14-day refund, no questions`,
+        `**\u{1F513} Landsafe Pro** \u2014 every finding above becomes a ready-to-paste zero-downtime migration, with lock-impact estimated against your real table sizes (from a stats-only snapshot \u2014 never row data). [See pricing \u2192](${proUrl}) \xB7 14-day refund, no questions`,
         ""
       );
     }
     F.push("---", "", `<sub>\u{1F6EC} [Landsafe](https://landsafe.dev) v${report.engineVersion} \xB7 Postgres migration safety \xB7 advisory-only, a human always merges</sub>`);
+    F.push("", encodePayload(buildPayload(report, opts.now ?? /* @__PURE__ */ new Date())));
     return F.join("\n");
   };
   for (const f of report.findings) {
@@ -26033,6 +26094,147 @@ var dim = paint("2");
 var bold = paint("1");
 var green = paint("32;1");
 
+// packages/engine/src/render/digest.ts
+var fmtDate = (iso) => iso.slice(0, 10);
+function renderDigestMarkdown(report, opts = {}) {
+  const L = [];
+  const window = `${fmtDate(report.since)} \u2192 ${fmtDate(report.until)}`;
+  const who = report.org ? ` \xB7 ${report.org}` : "";
+  L.push(`*Landsafe weekly digest*${who} \xB7 ${window}`);
+  L.push("");
+  if (!report.complete) {
+    const n = report.unreadable.length;
+    L.push(`\u{1F6A8} *This digest is incomplete \u2014 ${n} repo${n === 1 ? "" : "s"} could not be read.* Every count below is a lower bound, not a total.`);
+    for (const u of report.unreadable.slice(0, 5)) L.push(`\u2022 \`${u.repo}\` \u2014 ${u.reason}`);
+    if (n > 5) L.push(`\u2022 \u2026and ${n - 5} more`);
+    L.push(`_Most often the token lacks read access. The default \`github.token\` only sees its own repo \u2014 a cross-repo digest needs a PAT or GitHub App token with read access to each repo._`);
+    L.push("");
+  }
+  if (report.prsAnalyzed === 0) {
+    L.push(report.complete ? "No migration PRs analyzed this week." : "No migration PRs could be read this week \u2014 see the access problem above.");
+    return L.join("\n");
+  }
+  if (report.quiet) {
+    L.push(
+      report.complete ? `Clean week: ${report.prsAnalyzed} migration PR${report.prsAnalyzed === 1 ? "" : "s"} across ${report.reposCovered} repo${report.reposCovered === 1 ? "" : "s"}, nothing flagged.` : `Nothing flagged in the ${report.prsAnalyzed} PR${report.prsAnalyzed === 1 ? "" : "s"} across ${report.reposCovered} repo${report.reposCovered === 1 ? "" : "s"} we could read \u2014 but this is not a clean bill of health, see above.`
+    );
+    return L.join("\n");
+  }
+  const t = report.totals;
+  L.push(
+    `${report.prsAnalyzed} migration PR${report.prsAnalyzed === 1 ? "" : "s"} across ${report.reposCovered} repo${report.reposCovered === 1 ? "" : "s"} \u2014 *${t.critical} critical* \xB7 ${t.warning} warning \xB7 ${t.info} info`
+  );
+  L.push("");
+  if (report.mergedWithCritical.length > 0) {
+    const n = report.mergedWithCritical.length;
+    L.push(`\u26A0\uFE0F *${n} PR${n === 1 ? "" : "s"} merged with critical findings unresolved*`);
+    L.push("");
+    for (const m of report.mergedWithCritical.slice(0, 10)) {
+      const by = m.author ? ` \xB7 @${m.author}` : "";
+      L.push(`\u2022 <${m.url}|${m.repo}#${m.number}> \u2014 ${m.title} (${m.critical} critical${by})`);
+      L.push(`  ${m.rules.join(", ")}`);
+    }
+    if (n > 10) L.push(`  \u2026and ${n - 10} more`);
+    L.push("");
+  } else if (t.critical > 0) {
+    L.push(report.complete ? `\u2705 Every PR with a critical finding was fixed or is still open \u2014 nothing dangerous merged.` : `Nothing dangerous merged *in the repos we could read* \u2014 this is not a full picture, see above.`);
+    L.push("");
+  }
+  if (report.byRepo.length > 1) {
+    L.push("*By repo*");
+    for (const r of report.byRepo.slice(0, 10)) {
+      L.push(`\u2022 ${r.repo} \u2014 ${r.critical} critical \xB7 ${r.warning} warning (${r.prs} PR${r.prs === 1 ? "" : "s"})`);
+    }
+    L.push("");
+  }
+  if (report.byRule.length > 0) {
+    L.push("*Most-hit rules*");
+    for (const r of report.byRule.slice(0, 5)) {
+      L.push(`\u2022 \`${r.rule}\` \u2014 ${r.count}\xD7 across ${r.repos.length} repo${r.repos.length === 1 ? "" : "s"} (${r.severity})`);
+    }
+    L.push("");
+  }
+  if (opts.dashboardUrl) L.push(`<${opts.dashboardUrl}|Open the Landsafe dashboard>`);
+  return L.join("\n");
+}
+
+// packages/engine/src/digest.ts
+var SEV_RANK = { critical: 0, warning: 1, info: 2 };
+function buildDigest(prs, opts) {
+  const since = Date.parse(opts.since);
+  const until = Date.parse(opts.until);
+  const inWindow = prs.filter((p) => {
+    const t = Date.parse(p.updatedAt);
+    return Number.isFinite(t) && t >= since && t < until;
+  });
+  const totals = { critical: 0, warning: 0, info: 0 };
+  const ruleMap = /* @__PURE__ */ new Map();
+  const repoMap = /* @__PURE__ */ new Map();
+  const mergedWithCritical = [];
+  let prsWithCritical = 0;
+  for (const pr of inWindow) {
+    const c = pr.payload.counts;
+    totals.critical += c.critical;
+    totals.warning += c.warning;
+    totals.info += c.info;
+    if (c.critical > 0) prsWithCritical++;
+    let repoT = repoMap.get(pr.repo);
+    if (!repoT) {
+      repoT = { repo: pr.repo, prs: 0, critical: 0, warning: 0, info: 0 };
+      repoMap.set(pr.repo, repoT);
+    }
+    repoT.prs++;
+    repoT.critical += c.critical;
+    repoT.warning += c.warning;
+    repoT.info += c.info;
+    for (const f of pr.payload.findings) {
+      let rt = ruleMap.get(f.r);
+      if (!rt) {
+        rt = { rule: f.r, severity: f.s, count: 0, repos: [] };
+        ruleMap.set(f.r, rt);
+      }
+      rt.count++;
+      if (!rt.repos.includes(pr.repo)) rt.repos.push(pr.repo);
+    }
+    if (pr.mergedAt && c.critical > 0) {
+      mergedWithCritical.push({
+        repo: pr.repo,
+        number: pr.number,
+        title: pr.title,
+        url: pr.url,
+        author: pr.author,
+        mergedAt: pr.mergedAt,
+        critical: c.critical,
+        warning: c.warning,
+        rules: [...new Set(pr.payload.findings.filter((f) => f.s === "critical").map((f) => f.r))]
+      });
+    }
+  }
+  const byRule = [...ruleMap.values()].sort(
+    (a, b) => SEV_RANK[a.severity] - SEV_RANK[b.severity] || b.count - a.count || a.rule.localeCompare(b.rule)
+  );
+  const byRepo = [...repoMap.values()].sort(
+    (a, b) => b.critical - a.critical || b.warning - a.warning || a.repo.localeCompare(b.repo)
+  );
+  mergedWithCritical.sort((a, b) => b.critical - a.critical || Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
+  const unreadable = opts.unreadable ?? [];
+  return {
+    org: opts.org,
+    since: opts.since,
+    until: opts.until,
+    unreadable,
+    complete: unreadable.length === 0,
+    reposCovered: repoMap.size,
+    prsAnalyzed: inWindow.length,
+    totals,
+    prsWithCritical,
+    mergedWithCritical,
+    byRule,
+    byRepo,
+    quiet: totals.critical === 0 && totals.warning === 0 && totals.info === 0
+  };
+}
+
 // packages/action/src/lib.ts
 var import_node_fs = require("node:fs");
 var import_node_path = require("node:path");
@@ -26042,7 +26244,14 @@ var import_node_crypto = require("node:crypto");
 var LANDSAFE_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA2nNrX8JCpQXnLQbPhHYWJYXf7pthiElf8Zi11+0IFtA=
 -----END PUBLIC KEY-----`;
-function b64urlDecode(s) {
+var FAIL_ON_STRICTNESS = { never: 0, critical: 1, warning: 2 };
+function effectiveFailOn(local, policy) {
+  const orgFailOn = policy?.failOn;
+  if (!orgFailOn) return { failOn: local, forcedByOrg: false };
+  const stricter = FAIL_ON_STRICTNESS[orgFailOn] > FAIL_ON_STRICTNESS[local] ? orgFailOn : local;
+  return { failOn: stricter, forcedByOrg: stricter === orgFailOn && orgFailOn !== local };
+}
+function b64urlDecode2(s) {
   return Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
 function verifyLicense(key, now = /* @__PURE__ */ new Date()) {
@@ -26051,8 +26260,8 @@ function verifyLicense(key, now = /* @__PURE__ */ new Date()) {
   const parts = trimmed.split(".");
   if (parts.length !== 3 || parts[0] !== "LSK1") return { valid: false, reason: "malformed" };
   try {
-    const payloadRaw = b64urlDecode(parts[1]);
-    const sig = b64urlDecode(parts[2]);
+    const payloadRaw = b64urlDecode2(parts[1]);
+    const sig = b64urlDecode2(parts[2]);
     const pub = (0, import_node_crypto.createPublicKey)(LANDSAFE_PUBLIC_KEY_PEM);
     const ok = (0, import_node_crypto.verify)(null, payloadRaw, pub, sig);
     if (!ok) return { valid: false, reason: "bad-signature" };
@@ -26186,11 +26395,146 @@ function resolveProUrl(input) {
 function resolveLicense(key, verify = verifyLicense) {
   if (!key || key.trim() === "") return { pro: false };
   const res = verify(key);
-  if (res.valid) return { pro: true };
+  if (res.valid) {
+    return res.payload ? { pro: true, payload: res.payload } : { pro: true };
+  }
   return {
     pro: false,
     warning: `Landsafe license key was provided but is not valid (${res.reason ?? "unknown"}). Running in Free mode \u2014 detection rules still apply.`
   };
+}
+function resolveFailOn(local, payload) {
+  const { failOn, forcedByOrg } = effectiveFailOn(local, payload?.orgPolicy);
+  if (!forcedByOrg) return { failOn, forcedByOrg: false };
+  const org = payload?.org ?? "unnamed org";
+  return {
+    failOn,
+    forcedByOrg: true,
+    message: `Org policy (license: ${org}) requires fail-on=${failOn}; this repo's setting (${local}) was tightened.`
+  };
+}
+function parseMode(input) {
+  const trimmed = (input ?? "").trim().toLowerCase();
+  if (trimmed === "" || trimmed === "review") return "review";
+  if (trimmed === "digest") return "digest";
+  throw new Error(`Invalid mode "${trimmed}" \u2014 use 'review' or 'digest'.`);
+}
+var DIGEST_UPSELL = "Digest requires Landsafe Business \u2014 see https://landsafe.dev/#pricing";
+function digestLicensed(license) {
+  const tier = license.payload?.tier;
+  if (license.pro && (tier === "team" || tier === "business")) return { ok: true };
+  return { ok: false, message: DIGEST_UPSELL };
+}
+function parseDigestRepos(input) {
+  return (input ?? "").split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !l.startsWith("#"));
+}
+function digestWindow(sinceDaysInput, now = /* @__PURE__ */ new Date()) {
+  const parsed = Number.parseInt((sinceDaysInput ?? "").trim() || "7", 10);
+  const days = Number.isFinite(parsed) && parsed > 0 ? parsed : 7;
+  return {
+    since: new Date(now.getTime() - days * 864e5).toISOString(),
+    until: now.toISOString()
+  };
+}
+var PER_PAGE = 100;
+var MAX_PR_PAGES = 10;
+async function resolveDigestRepos(deps, input, org, currentRepo, warn) {
+  const explicit = parseDigestRepos(input);
+  if (explicit.length > 0) return explicit;
+  try {
+    const repos = await deps.listOrgRepos(org);
+    if (repos.length > 0) return repos;
+    warn(`No repos found in "${org}" \u2014 digesting ${currentRepo} only.`);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    warn(`Could not list repos in "${org}" (${reason}) \u2014 digesting ${currentRepo} only. Set 'digest-repos' to name them explicitly.`);
+  }
+  return [currentRepo];
+}
+function findPayload(comments) {
+  for (let i = comments.length - 1; i >= 0; i--) {
+    const body = comments[i]?.body;
+    if (!body || !body.includes(PAYLOAD_PREFIX)) continue;
+    const payload = extractPayload(body);
+    if (payload) return payload;
+  }
+  return void 0;
+}
+async function collectRepoPulls(deps, repo, since, until, perPage = PER_PAGE) {
+  const sinceMs = since.getTime();
+  const untilMs = until.getTime();
+  const out = [];
+  for (let page = 1; page <= MAX_PR_PAGES; page++) {
+    const pulls = await deps.listPullsPage(repo, page, perPage);
+    if (pulls.length === 0) break;
+    let pastWindow = false;
+    for (const p of pulls) {
+      const t = Date.parse(p.updated_at);
+      if (!Number.isFinite(t)) continue;
+      if (t < sinceMs) {
+        pastWindow = true;
+        break;
+      }
+      if (t < untilMs) out.push(p);
+    }
+    if (pastWindow || pulls.length < perPage) break;
+  }
+  return out;
+}
+async function collectDigestPrs(deps, repos, since, until, warn, perPage = PER_PAGE) {
+  const prs = [];
+  const unreadable = [];
+  for (const repo of repos) {
+    let pulls;
+    try {
+      pulls = await collectRepoPulls(deps, repo, since, until, perPage);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      warn(`Skipping ${repo}: ${reason}`);
+      unreadable.push({ repo, reason });
+      continue;
+    }
+    for (const p of pulls) {
+      let payload;
+      try {
+        payload = findPayload(await deps.listIssueComments(repo, p.number));
+      } catch (err) {
+        warn(`Skipping ${repo}#${p.number}: ${err instanceof Error ? err.message : String(err)}`);
+        continue;
+      }
+      if (!payload) continue;
+      const pr = {
+        repo,
+        number: p.number,
+        title: p.title,
+        url: p.html_url,
+        updatedAt: p.updated_at,
+        payload
+      };
+      if (p.user?.login) pr.author = p.user.login;
+      if (p.merged_at) pr.mergedAt = p.merged_at;
+      prs.push(pr);
+    }
+  }
+  return { prs, unreadable };
+}
+async function postDigestWebhook(url, markdown, warn, fetchImpl = fetch) {
+  try {
+    const res = await fetchImpl(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: markdown })
+    });
+    if (!res.ok) {
+      warn(`Digest webhook returned ${res.status} ${res.statusText}. The digest is in the job summary.`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    warn(`Could not POST the digest webhook (${reason}). The digest is in the job summary.`);
+    return false;
+  }
 }
 function parseSnapshot(json) {
   let parsed;
@@ -26249,6 +26593,82 @@ function octokitCommentDeps(octokit, owner, repo) {
     }
   };
 }
+function splitRepo(full) {
+  const [owner = "", repo = ""] = full.split("/");
+  return { owner, repo };
+}
+function octokitDigestDeps(octokit) {
+  return {
+    // One page at a time — collectRepoPulls stops at the window edge, so we must
+    // not hand it an eager paginate() that would walk the repo's full history.
+    async listPullsPage(full, page, perPage) {
+      const { owner, repo } = splitRepo(full);
+      const res = await octokit.rest.pulls.list({
+        owner,
+        repo,
+        state: "all",
+        sort: "updated",
+        direction: "desc",
+        per_page: perPage,
+        page
+      });
+      return res.data;
+    },
+    async listIssueComments(full, issueNumber) {
+      const { owner, repo } = splitRepo(full);
+      return octokit.paginate(octokit.rest.issues.listComments, {
+        owner,
+        repo,
+        issue_number: issueNumber,
+        per_page: 100
+      });
+    },
+    async listOrgRepos(org) {
+      const repos = await octokit.paginate(octokit.rest.repos.listForOrg, { org, per_page: 100 });
+      return repos.map((r) => r.full_name);
+    }
+  };
+}
+async function runDigest(octokit, license) {
+  const licensed = digestLicensed(license);
+  if (!licensed.ok) {
+    core.setFailed(licensed.message ?? "Digest requires Landsafe Business.");
+    return;
+  }
+  if (!octokit) {
+    core.setFailed("Digest mode needs a github-token with read access to your repos and their pull requests.");
+    return;
+  }
+  const { owner, repo } = github.context.repo;
+  const currentRepo = `${owner}/${repo}`;
+  const { since, until } = digestWindow(core.getInput("digest-since-days"));
+  const dashboardUrl = core.getInput("digest-dashboard-url").trim();
+  const webhook = core.getInput("digest-webhook").trim();
+  const deps = octokitDigestDeps(octokit);
+  const repos = await resolveDigestRepos(deps, core.getInput("digest-repos"), owner, currentRepo, (m) => core.warning(m));
+  core.info(`Digest window ${since} \u2192 ${until} across ${repos.length} repo(s).`);
+  const { prs, unreadable } = await collectDigestPrs(deps, repos, new Date(since), new Date(until), (m) => core.warning(m));
+  core.info(`Found ${prs.length} PR(s) carrying a Landsafe report.`);
+  const report = buildDigest(prs, { since, until, org: owner, unreadable });
+  const markdown = renderDigestMarkdown(report, dashboardUrl ? { dashboardUrl } : {});
+  try {
+    await core.summary.addRaw(markdown).write();
+  } catch (err) {
+    core.debug(`Could not write job summary: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (webhook) {
+    const ok = await postDigestWebhook(webhook, markdown, (m) => core.warning(m));
+    if (ok) core.info("Digest posted to the webhook.");
+  }
+  core.setOutput("critical", String(report.totals.critical));
+  core.setOutput("warning", String(report.totals.warning));
+  core.setOutput("info", String(report.totals.info));
+  core.setOutput("prs-analyzed", String(report.prsAnalyzed));
+  core.setOutput("repos-covered", String(report.reposCovered));
+  core.info(
+    `Digest: ${report.prsAnalyzed} PR(s), ${report.reposCovered} repo(s), ${report.mergedWithCritical.length} merged with unresolved criticals.`
+  );
+}
 async function changedFilesFromPR(octokit) {
   const { owner, repo } = github.context.repo;
   const pullNumber = github.context.issue.number;
@@ -26262,8 +26682,9 @@ async function changedFilesFromPR(octokit) {
 }
 async function run() {
   const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+  const mode = parseMode(core.getInput("mode"));
   const patterns = parsePatterns(core.getInput("paths"));
-  const failOn = (core.getInput("fail-on") || "critical").trim();
+  const localFailOn = (core.getInput("fail-on") || "critical").trim();
   const pgVersion = Number.parseInt(core.getInput("pg-version") || "15", 10) || 15;
   const assumeTransaction = (core.getInput("assume-transaction") || "true").trim() !== "false";
   const snapshotPath = core.getInput("snapshot").trim();
@@ -26271,12 +26692,19 @@ async function run() {
   const wantComment = (core.getInput("comment") || "true").trim() !== "false";
   const proUrl = resolveProUrl(core.getInput("pro-url"));
   const token = core.getInput("github-token") || process.env.GITHUB_TOKEN || "";
-  if (!["critical", "warning", "never"].includes(failOn)) {
-    throw new Error(`Invalid fail-on value "${failOn}" \u2014 use 'critical', 'warning', or 'never'.`);
+  if (!["critical", "warning", "never"].includes(localFailOn)) {
+    throw new Error(`Invalid fail-on value "${localFailOn}" \u2014 use 'critical', 'warning', or 'never'.`);
   }
   const license = resolveLicense(licenseKey || void 0);
   if (license.warning) core.warning(license.warning);
   if (license.pro) core.info("Landsafe Pro license verified.");
+  const octokitEarly = token ? github.getOctokit(token) : void 0;
+  if (mode === "digest") {
+    await runDigest(octokitEarly, license);
+    return;
+  }
+  const { failOn, message: policyNote } = resolveFailOn(localFailOn, license.payload);
+  if (policyNote) core.info(policyNote);
   let snapshot;
   if (snapshotPath) {
     const abs = (0, import_node_path2.join)(workspace, snapshotPath);
@@ -26291,7 +26719,7 @@ async function run() {
   }
   const eventName = github.context.eventName;
   const isPR = eventName === "pull_request" || eventName === "pull_request_target";
-  const octokit = token ? github.getOctokit(token) : void 0;
+  const octokit = octokitEarly;
   let candidates;
   if (isPR && octokit) {
     candidates = await changedFilesFromPR(octokit);
