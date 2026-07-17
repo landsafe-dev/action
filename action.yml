@@ -1,0 +1,75 @@
+name: 'Landsafe — Postgres migration safety'
+description: >-
+  Catch dangerous Postgres migrations before they land. Lock analysis, plain-English
+  impact, and zero-downtime rewrites — as a sticky comment on every PR. Postgres-only v1.
+author: 'Landsafe'
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  paths:
+    description: >-
+      Multiline glob patterns for SQL migration files (supports **, *, ?).
+    required: false
+    default: |
+      **/migrations/**/*.sql
+      **/migrate/**/*.sql
+      db/**/*.sql
+      sql/**/*.sql
+  fail-on:
+    description: >-
+      When to fail the check: 'critical' (default), 'warning' (fail on warnings too),
+      or 'never' (report only).
+    required: false
+    default: 'critical'
+  pg-version:
+    description: 'Postgres major version to assume (affects lock behavior of some operations).'
+    required: false
+    default: '15'
+  assume-transaction:
+    description: >-
+      Assume the migration runner wraps each file in a transaction (true for most
+      runners: Flyway, dbmate, migrate, Sqitch-default).
+    required: false
+    default: 'true'
+  snapshot:
+    description: >-
+      Path to a landsafe.snapshot.json (produced by `landsafe snapshot`). With a Pro
+      license, unlocks impact estimates against your real table sizes.
+    required: false
+    default: ''
+  license:
+    description: >-
+      Landsafe Pro license key (offline Ed25519 — no phone-home). Recommended:
+      pass the LANDSAFE_LICENSE secret. Unlocks ready-to-paste rewrites and
+      snapshot-based impact numbers.
+    required: false
+    default: ''
+  comment:
+    description: "Post/update the sticky PR comment ('true'/'false')."
+    required: false
+    default: 'true'
+  pro-url:
+    description: >-
+      URL used for the "Unlock Pro" links in the PR comment and job summary.
+    required: false
+    default: 'https://landsafe.dev/#pricing'
+  github-token:
+    description: 'Token used to list changed PR files and post the comment.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  critical:
+    description: 'Number of critical findings.'
+  warning:
+    description: 'Number of warning findings.'
+  info:
+    description: 'Number of info findings.'
+  verdict:
+    description: "Overall verdict: 'ok', 'attention', or 'danger'."
+
+runs:
+  using: 'node20'
+  main: 'dist/index.cjs'
