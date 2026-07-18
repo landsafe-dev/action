@@ -43,6 +43,13 @@ inputs:
       license, unlocks impact estimates against your real table sizes.
     required: false
     default: ''
+  ignore-rules:
+    description: >-
+      Rule ids to suppress, comma-separated (e.g. 'unqualified-table-name,prefer-text').
+      See `npx landsafe rules` for the full catalogue. Detection stays deterministic —
+      this only mutes the listed rules' findings.
+    required: false
+    default: ''
   license:
     description: >-
       Landsafe Pro license key (offline Ed25519 — no phone-home). Recommended:
@@ -81,7 +88,7 @@ inputs:
   #     digest:
   #       runs-on: ubuntu-latest
   #       steps:
-  #         - uses: landsafe/landsafe-action@v1
+  #         - uses: landsafe-dev/action@v1
   #           with:
   #             mode: digest
   #             license: ${{ secrets.LANDSAFE_LICENSE }}

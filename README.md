@@ -54,7 +54,7 @@ One sticky comment, updated in place, never spammed:
 >
 > **Safe path:** Use CREATE INDEX CONCURRENTLY (outside a transaction), and handle the failed-build INVALID-index case.
 
-28 rules covering blocking index builds, full-table rewrites, validation scans under exclusive locks, lock-queue pileups, data loss, rolling-deploy breakage, and migrations that simply error at deploy time. Every one is version-aware: PG 11's fast defaults, PG 12's scan-free `SET NOT NULL`, `REINDEX CONCURRENTLY`, `DETACH PARTITION CONCURRENTLY` in 14. [Full rule reference →](https://github.com/landsafe-dev/action/blob/main/docs/RULES.md)
+44 rules covering blocking index builds, full-table rewrites, validation scans under exclusive locks, lock-queue pileups, data loss, rolling-deploy breakage, and migrations that simply error at deploy time. Every one is version-aware: PG 11's fast defaults, PG 12's scan-free `SET NOT NULL`, `REINDEX CONCURRENTLY`, `DETACH PARTITION CONCURRENTLY` in 14. [Full rule reference →](https://github.com/landsafe-dev/action/blob/main/docs/RULES.md)
 
 **It's advisory about merging, honest about signalling.** By default the check goes red on a critical finding — you'll see a failing check, and you can merge straight through it. Landsafe never holds a required status, never blocks a merge, and never touches your database. Want it purely informational? `fail-on: never`.
 
@@ -74,7 +74,7 @@ You shouldn't, on my say-so. So here's what's checkable:
 | | Free | Pro | Business |
 | --- | --- | --- | --- |
 | | **$0** | **$79/mo** | **$299/mo** |
-| All 28 rules, PR comment, CLI | ✅ | ✅ | ✅ |
+| All 44 rules, PR comment, CLI | ✅ | ✅ | ✅ |
 | Unlimited repos and developers | ✅ | ✅ | ✅ |
 | Ready-to-paste zero-downtime rewrites | — | ✅ | ✅ |
 | Impact estimates against your real table sizes | — | ✅ | ✅ |
@@ -113,10 +113,18 @@ If it can't read a repo it says so at the top of the digest, and marks the count
 Increasingly they do — and the thing that checks a migration shouldn't be another model with the same blind spots. Landsafe is a rule engine; it doesn't share weights with whatever wrote your SQL.
 
 ```sh
-npx landsafe init     # adds a Landsafe stanza to your AGENTS.md
+npx landsafe init     # adds a Landsafe stanza to AGENTS.md and CLAUDE.md
 ```
 
 Agents then run `npx landsafe check <files> --json --fail-on critical` before proposing a migration. `landsafe rules --json` lists everything it can report.
+
+Or wire it in as a tool the model can call but can't talk its way past:
+
+```sh
+npx landsafe mcp      # MCP server over stdio — check_migration, list_rules
+```
+
+Same engine, same rules, same answers as CI — so an agent can't get a verdict locally that the PR check later contradicts.
 
 ## Limits, stated plainly
 

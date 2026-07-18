@@ -24197,7 +24197,7 @@ function tokenize(text, startLine = 1) {
     }
     const wm = WORD_RE.exec(text.slice(i));
     if (wm) {
-      toks.push({ v: wm[0].toUpperCase(), kind: "word", line });
+      toks.push({ v: wm[0].toUpperCase(), kind: "word", line, raw: wm[0] });
       i += wm[0].length;
       continue;
     }
@@ -24217,6 +24217,63 @@ function tokenize(text, startLine = 1) {
     i++;
   }
   return toks;
+}
+
+// packages/engine/src/locks.ts
+var AE = (duration) => ({
+  lock: "ACCESS EXCLUSIVE",
+  blocksReads: true,
+  blocksWrites: true,
+  duration
+});
+var SHARE_ROW_EXCLUSIVE = (duration) => ({
+  lock: "SHARE ROW EXCLUSIVE",
+  blocksReads: false,
+  blocksWrites: true,
+  duration
+});
+var SHARE = (duration) => ({
+  lock: "SHARE",
+  blocksReads: false,
+  blocksWrites: true,
+  // blocks INSERT/UPDATE/DELETE; reads OK
+  duration
+});
+var VOLATILE_FNS = [
+  "CLOCK_TIMESTAMP",
+  "TIMEOFDAY",
+  "RANDOM",
+  "RANDOM_NORMAL",
+  "GEN_RANDOM_UUID",
+  "GEN_RANDOM_BYTES",
+  // uuid-ossp: v1/v1mc mix the clock with a (random, for v1mc) node id; v4 is random. v3/v5
+  // are deterministic hashes (IMMUTABLE) and are deliberately absent.
+  "UUID_GENERATE_V1",
+  "UUID_GENERATE_V1MC",
+  "UUID_GENERATE_V4",
+  "NEXTVAL",
+  "CURRVAL"
+];
+function addColumnDefaultProfile(pgVersion, volatile) {
+  if (volatile || pgVersion < 11) return { profile: AE("rewrite"), rewritesTable: true };
+  return { profile: AE("instant"), rewritesTable: false };
+}
+function typeChangeNeedsRewrite(fromHint, toType) {
+  const to = toType.toUpperCase().replace(/\s+/g, " ").trim();
+  if (/^(CHARACTER VARYING|VARCHAR)\s*\(\d+\)$/.test(to)) {
+    return false;
+  }
+  if (to === "TEXT" || to === "CHARACTER VARYING" || to === "VARCHAR") return false;
+  if (/^NUMERIC\s*\(/.test(to) || /^DECIMAL\s*\(/.test(to)) return false;
+  return true;
+}
+function setNotNullProfile() {
+  return AE("scan");
+}
+function blocksLabel(p) {
+  if (p.blocksReads && p.blocksWrites) return "ALL reads and writes";
+  if (p.blocksWrites) return "all writes (reads continue)";
+  return "no normal traffic (DDL/vacuum only)";
 }
 
 // packages/engine/src/parse.ts
@@ -24247,6 +24304,7 @@ var Cur = class {
     return this.i >= this.t.length;
   }
 };
+var isOp = (t, v) => t?.kind === "op" && t.v === v;
 function quoteIdent(v) {
   return `"${v.replace(/"/g, '""')}"`;
 }
@@ -24267,7 +24325,7 @@ function readNameFull(c) {
     }
     break;
   }
-  return keys.length ? { key: keys.join("."), sql: sqls.join(".") } : void 0;
+  return keys.length ? { key: keys.join("."), sql: sqls.join("."), parts: keys.length } : void 0;
 }
 function readName(c) {
   return readNameFull(c)?.key;
@@ -24300,8 +24358,8 @@ function readType(c) {
     if (!t) break;
     if (depth === 0 && t.kind === "word" && TYPE_STOPWORDS.has(t.v)) break;
     if (depth === 0 && t.kind === "op" && (t.v === "," || t.v === ")")) break;
-    if (t.v === "(") depth++;
-    if (t.v === ")") {
+    if (isOp(t, "(")) depth++;
+    if (isOp(t, ")")) {
       if (depth === 0) break;
       depth--;
     }
@@ -24310,15 +24368,25 @@ function readType(c) {
   }
   return parts.join(" ").replace(/\s*\(\s*/g, "(").replace(/\s*\)/g, ")").replace(/\s*,\s*/g, ",");
 }
+function optionEnabled(inner, name) {
+  for (let i = 0; i < inner.length; i++) {
+    if (inner[i].kind === "word" && inner[i].v === name) {
+      const nx = inner[i + 1];
+      if (nx && (nx.v === "FALSE" || nx.v === "OFF" || nx.v === "0")) return false;
+      return true;
+    }
+  }
+  return false;
+}
 function readParenGroup(c) {
   const inner = [];
-  if (c.v() !== "(") return inner;
+  if (!isOp(c.peek(), "(")) return inner;
   c.skip();
   let depth = 1;
   while (!c.done() && depth > 0) {
     const t = c.eat();
-    if (t.v === "(") depth++;
-    else if (t.v === ")") {
+    if (isOp(t, "(")) depth++;
+    else if (isOp(t, ")")) {
       depth--;
       if (depth === 0) break;
     }
@@ -24334,22 +24402,99 @@ function readExpr(c, stops) {
     if (!t) break;
     if (depth === 0 && t.kind === "word" && stops.has(t.v)) break;
     if (depth === 0 && t.kind === "op" && (t.v === "," || t.v === ")")) break;
-    if (t.v === "(") depth++;
-    if (t.v === ")") depth--;
+    if (isOp(t, "(")) depth++;
+    if (isOp(t, ")")) depth--;
     parts.push(t.kind === "str" ? `'${t.v}'` : t.v);
     c.skip();
   }
   return parts.join(" ").replace(/\s*\(\s*/g, "(").replace(/\s*\)/g, ")").replace(/\s*,\s*/g, ", ");
 }
+function keywordSeq(toks) {
+  const out = [];
+  let depth = 0;
+  for (const t of toks) {
+    if (isOp(t, "(")) {
+      depth++;
+      continue;
+    }
+    if (isOp(t, ")")) {
+      if (depth > 0) depth--;
+      continue;
+    }
+    if (depth === 0 && t.kind === "word") out.push(t.v);
+  }
+  return out.join(" ");
+}
 function hasTopLevelWhere(toks, from) {
   let depth = 0;
   for (let i = from; i < toks.length; i++) {
     const t = toks[i];
-    if (t.v === "(") depth++;
-    else if (t.v === ")") depth--;
+    if (isOp(t, "(")) depth++;
+    else if (isOp(t, ")")) depth--;
     else if (depth === 0 && t.kind === "word" && t.v === "WHERE") return true;
   }
   return false;
+}
+var BENIGN_FIRST_WORDS = /* @__PURE__ */ new Set([
+  "GRANT",
+  "REVOKE",
+  "COMMENT",
+  "ANALYZE",
+  "DO",
+  "CALL",
+  "NOTIFY",
+  "LISTEN",
+  "UNLISTEN",
+  "RESET",
+  "SHOW",
+  "EXPLAIN",
+  "CHECKPOINT",
+  "DISCARD",
+  "PREPARE",
+  "EXECUTE",
+  "DEALLOCATE",
+  "MERGE",
+  "COPY",
+  "IMPORT",
+  "SECURITY",
+  "TABLE",
+  "VALUES",
+  "SAVEPOINT",
+  "RELEASE",
+  "FETCH",
+  "MOVE",
+  "DECLARE",
+  "CLOSE",
+  "REASSIGN"
+]);
+function hasAndChain(toks) {
+  return toks.some((t, i) => t.kind === "word" && t.v === "AND" && toks[i + 1]?.kind === "word" && toks[i + 1]?.v === "CHAIN");
+}
+function defaultLooksVolatile(toks) {
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    const name = t.kind === "word" ? t.v : t.kind === "qident" ? t.v.toUpperCase() : void 0;
+    if (name && VOLATILE_FNS.includes(name) && isOp(toks[i + 1], "(")) return true;
+  }
+  return false;
+}
+function parseCteBodyDml(inner) {
+  if (inner.length === 0) return void 0;
+  const b = new Cur(inner);
+  if (b.v() === "UPDATE" && b.kind() === "word") {
+    b.skip();
+    if (b.v() === "ONLY") b.skip();
+    const n = readNameFull(b);
+    return { kind: "update", table: n?.key, tableSql: n?.sql, hasWhere: hasTopLevelWhere(inner, b.i) };
+  }
+  if (b.v() === "DELETE" && b.kind() === "word") {
+    b.skip();
+    if (b.v() === "FROM") b.skip();
+    if (b.v() === "ONLY") b.skip();
+    const n = readNameFull(b);
+    return { kind: "delete", table: n?.key, tableSql: n?.sql, hasWhere: hasTopLevelWhere(inner, b.i) };
+  }
+  return void 0;
 }
 function parseStatement(text, startLine = 1) {
   const toks = tokenize(text, startLine);
@@ -24365,29 +24510,40 @@ function parseCore(c, toks) {
   if (c.v() === "WITH" && c.kind() === "word") {
     c.skip();
     if (c.v() === "RECURSIVE") c.skip();
+    let unboundedCteDml;
     for (; ; ) {
       readName(c);
-      if (c.v() === "(") readParenGroup(c);
+      if (isOp(c.peek(), "(")) readParenGroup(c);
       if (c.v() === "AS") c.skip();
       if (c.is("NOT", "MATERIALIZED")) c.skip(2);
       else if (c.v() === "MATERIALIZED") c.skip();
-      if (c.v() === "(") readParenGroup(c);
-      if (c.v() === ",") {
+      const body = isOp(c.peek(), "(") ? readParenGroup(c) : [];
+      if (!unboundedCteDml) {
+        const dml = parseCteBodyDml(body);
+        if (dml && dml.hasWhere === false) unboundedCteDml = dml;
+      }
+      if (isOp(c.peek(), ",")) {
         c.skip();
         continue;
       }
       break;
     }
+    if (unboundedCteDml) return unboundedCteDml;
   }
   try {
     switch (c.v()) {
       case "BEGIN":
       case "START":
         return { kind: "begin" };
+      case "ROLLBACK": {
+        const afterNoise = c.v(1) === "WORK" || c.v(1) === "TRANSACTION" ? c.v(2) : c.v(1);
+        if (afterNoise === "TO") return { kind: "other-statement" };
+        return { kind: "commit", chain: hasAndChain(toks), chainRollback: true };
+      }
       case "COMMIT":
       case "END":
-      case "ROLLBACK":
-        return { kind: "commit" };
+      case "ABORT":
+        return { kind: "commit", chain: hasAndChain(toks) };
       case "SET":
         return parseSet(c);
       case "CREATE":
@@ -24406,9 +24562,9 @@ function parseCore(c, toks) {
       case "VACUUM": {
         c.skip();
         let full = false;
-        if (c.v() === "(") {
+        if (isOp(c.peek(), "(")) {
           const inner = readParenGroup(c);
-          full = inner.some((t) => t.v === "FULL");
+          full = optionEnabled(inner, "FULL");
         } else if (c.v() === "FULL") {
           full = true;
           c.skip();
@@ -24424,9 +24580,9 @@ function parseCore(c, toks) {
       case "REINDEX": {
         c.skip();
         let concurrently = false;
-        if (c.v() === "(") {
+        if (isOp(c.peek(), "(")) {
           const inner = readParenGroup(c);
-          concurrently = inner.some((t) => t.v === "CONCURRENTLY");
+          concurrently = optionEnabled(inner, "CONCURRENTLY");
         }
         if (["INDEX", "TABLE", "SCHEMA", "DATABASE", "SYSTEM"].includes(c.v())) c.skip();
         if (c.v() === "CONCURRENTLY") {
@@ -24457,9 +24613,16 @@ function parseCore(c, toks) {
       case "LOCK": {
         c.skip();
         if (c.v() === "TABLE") c.skip();
-        return { kind: "lock-table", table: readName(c) };
+        if (c.v() === "ONLY") c.skip();
+        const table = readName(c);
+        const rest = c.t.slice(c.i);
+        const inIdx = rest.findIndex((t) => t.kind === "word" && t.v === "IN");
+        const modeIdx = rest.findIndex((t) => t.kind === "word" && t.v === "MODE");
+        const lockMode = inIdx !== -1 && modeIdx > inIdx ? rest.slice(inIdx + 1, modeIdx).filter((t) => t.kind === "word").map((t) => t.v).join(" ") : void 0;
+        return { kind: "lock-table", table, lockMode };
       }
       default:
+        if (c.kind() === "word" && BENIGN_FIRST_WORDS.has(c.v())) return { kind: "other-statement" };
         return { kind: "unknown" };
     }
   } catch {
@@ -24477,8 +24640,41 @@ function parseSet(c) {
   const value = valTok ? valTok.kind === "str" ? valTok.v : valTok.v : "";
   return { kind: "set", setParam: { name: name.toLowerCase(), value: String(value).toLowerCase() } };
 }
+var BENIGN_CREATE = /* @__PURE__ */ new Set([
+  "VIEW",
+  "MATERIALIZED",
+  "FUNCTION",
+  "PROCEDURE",
+  "SEQUENCE",
+  "TYPE",
+  "EXTENSION",
+  "SCHEMA",
+  "POLICY",
+  "ROLE",
+  "USER",
+  "GROUP",
+  "RULE",
+  "AGGREGATE",
+  "CAST",
+  "COLLATION",
+  "CONVERSION",
+  "PUBLICATION",
+  "SUBSCRIPTION",
+  "SERVER",
+  "FOREIGN",
+  "STATISTICS",
+  "OPERATOR",
+  "LANGUAGE",
+  "TABLESPACE",
+  "DATABASE",
+  "TEXT",
+  "ACCESS",
+  "EVENT",
+  "TRANSFORM"
+]);
 function parseCreate(c) {
   c.skip();
+  if (c.is("OR", "REPLACE")) c.skip(2);
   let unique = false;
   if (c.v() === "UNIQUE") {
     unique = true;
@@ -24491,6 +24687,7 @@ function parseCreate(c) {
       concurrently = true;
       c.skip();
     }
+    const ifExists = c.is("IF", "NOT", "EXISTS");
     skipIfExists(c);
     let name;
     if (c.v() !== "ON") name = readName(c);
@@ -24504,30 +24701,67 @@ function parseCreate(c) {
       c.skip();
     }
     const index = { unique, concurrently, name, method };
-    return { kind: "create-index", table, index };
+    return { kind: "create-index", table, index, ifExists };
   }
-  if (c.v() === "GLOBAL" || c.v() === "LOCAL" || c.v() === "TEMPORARY" || c.v() === "TEMP" || c.v() === "UNLOGGED") c.skip();
+  if (c.v() === "CONSTRAINT" && c.v(1) === "TRIGGER") c.skip();
+  if (c.v() === "TRIGGER") {
+    c.skip();
+    readName(c);
+    let depth = 0;
+    while (!c.done()) {
+      const t = c.peek();
+      if (isOp(t, "(")) depth++;
+      else if (isOp(t, ")")) depth--;
+      else if (depth === 0 && t.kind === "word" && t.v === "ON") {
+        c.skip();
+        break;
+      }
+      c.skip();
+    }
+    const trigNamed = readNameFull(c);
+    return { kind: "create-trigger", table: trigNamed?.key, tableSql: trigNamed?.sql };
+  }
+  if (c.v() === "DOMAIN") {
+    c.skip();
+    readName(c);
+    if (c.v() === "AS") c.skip();
+    readType(c);
+    const kw = keywordSeq(c.t.slice(c.i));
+    const domainHasConstraint = /\bCHECK\b|\bNOT NULL\b|\bCONSTRAINT\b/.test(kw);
+    return { kind: "create-domain", domainHasConstraint };
+  }
+  let temp = false;
+  while (["GLOBAL", "LOCAL", "TEMPORARY", "TEMP", "UNLOGGED"].includes(c.v())) {
+    if (c.v() === "TEMPORARY" || c.v() === "TEMP") temp = true;
+    c.skip();
+  }
   if (c.v() === "TABLE") {
     c.skip();
+    const ifExists = c.is("IF", "NOT", "EXISTS");
     skipIfExists(c);
-    const table = readName(c);
-    if (c.v() === "AS") return { kind: "create-table-as", table };
+    const named = readNameFull(c);
+    const table = named?.key;
+    const tableSql = named?.sql;
+    const tableQualified = (named?.parts ?? 1) > 1;
+    if (c.v() === "AS") return { kind: "create-table-as", table, tableSql, tableQualified, ifExists, temp };
     const columns = parseCreateTableColumns(c);
-    return { kind: "create-table", table, columns };
+    if (c.v() === "AS") return { kind: "create-table-as", table, tableSql, tableQualified, ifExists, temp };
+    return { kind: "create-table", table, columns, tableSql, tableQualified, ifExists, temp };
   }
+  if (c.kind() === "word" && BENIGN_CREATE.has(c.v())) return { kind: "other-statement" };
   return { kind: "unknown" };
 }
 function parseCreateTableColumns(c) {
   const cols = [];
-  if (c.v() !== "(") return cols;
+  if (!isOp(c.peek(), "(")) return cols;
   const inner = readParenGroup(c);
   const groups = [];
   let cur = [];
   let depth = 0;
   for (const t of inner) {
-    if (t.v === "(") depth++;
-    if (t.v === ")") depth--;
-    if (t.v === "," && depth === 0) {
+    if (isOp(t, "(")) depth++;
+    if (isOp(t, ")")) depth--;
+    if (isOp(t, ",") && depth === 0) {
       groups.push(cur);
       cur = [];
       continue;
@@ -24543,18 +24777,51 @@ function parseCreateTableColumns(c) {
     const name = readName(gc);
     if (!name) continue;
     const typeText = readType(gc);
-    const rest = g.slice(gc.i).map((t) => t.v).join(" ");
+    const kw = keywordSeq(g.slice(gc.i));
     const isSerial = /^(SMALLSERIAL|SERIAL|BIGSERIAL)\b/.test(typeText);
     cols.push({
       name,
       typeText,
       isSerial,
-      isPrimaryKey: /\bPRIMARY KEY\b/.test(rest),
-      notNull: /\bNOT NULL\b/.test(rest)
+      isPrimaryKey: /\bPRIMARY KEY\b/.test(kw),
+      notNull: /\bNOT NULL\b/.test(kw)
     });
   }
   return cols;
 }
+var BENIGN_DROP = /* @__PURE__ */ new Set([
+  "VIEW",
+  "MATERIALIZED",
+  "FUNCTION",
+  "PROCEDURE",
+  "SEQUENCE",
+  "EXTENSION",
+  "SCHEMA",
+  "DOMAIN",
+  "POLICY",
+  "ROLE",
+  "USER",
+  "GROUP",
+  "RULE",
+  "AGGREGATE",
+  "CAST",
+  "COLLATION",
+  "CONVERSION",
+  "PUBLICATION",
+  "SUBSCRIPTION",
+  "SERVER",
+  "FOREIGN",
+  "STATISTICS",
+  "OPERATOR",
+  "LANGUAGE",
+  "TABLESPACE",
+  "TRIGGER",
+  "OWNED",
+  "ACCESS",
+  "EVENT",
+  "TRANSFORM",
+  "TEXT"
+]);
 function parseDrop(c) {
   c.skip();
   if (c.v() === "INDEX") {
@@ -24564,26 +24831,91 @@ function parseDrop(c) {
       concurrently = true;
       c.skip();
     }
+    const ifExists = c.is("IF", "EXISTS");
     skipIfExists(c);
-    return { kind: "drop-index", concurrently, table: readName(c) };
+    return { kind: "drop-index", concurrently, table: readName(c), ifExists };
   }
   if (c.v() === "TABLE") {
     c.skip();
+    const ifExists = c.is("IF", "EXISTS");
     skipIfExists(c);
-    return { kind: "drop-table", table: readName(c) };
+    const dropNamed = readNameFull(c);
+    return { kind: "drop-table", table: dropNamed?.key, tableSql: dropNamed?.sql, tableQualified: (dropNamed?.parts ?? 1) > 1, ifExists };
+  }
+  if (c.v() === "TYPE") {
+    c.skip();
+    const ifExists = c.is("IF", "EXISTS");
+    skipIfExists(c);
+    return { kind: "drop-type", ifExists };
   }
   if (c.v() === "DATABASE") return { kind: "drop-database" };
+  if (c.kind() === "word" && BENIGN_DROP.has(c.v())) return { kind: "other-statement" };
   return { kind: "unknown" };
 }
+var BENIGN_ALTER = /* @__PURE__ */ new Set([
+  "SEQUENCE",
+  "VIEW",
+  "MATERIALIZED",
+  "FUNCTION",
+  "PROCEDURE",
+  "INDEX",
+  "ROLE",
+  "USER",
+  "GROUP",
+  "DEFAULT",
+  "SYSTEM",
+  "DATABASE",
+  "EXTENSION",
+  "PUBLICATION",
+  "SUBSCRIPTION",
+  "SERVER",
+  "FOREIGN",
+  "POLICY",
+  "TRIGGER",
+  "RULE",
+  "AGGREGATE",
+  "COLLATION",
+  "CONVERSION",
+  "OPERATOR",
+  "STATISTICS",
+  "TABLESPACE",
+  "TEXT",
+  "LARGE",
+  "LANGUAGE",
+  "CAST",
+  "EVENT"
+]);
 function parseAlter(c) {
   c.skip();
   if (c.v() === "TYPE") {
     c.skip();
     readName(c);
-    if (c.v() === "ADD" && c.v(1) === "VALUE") return { kind: "alter-type", enumAddValue: true };
+    if (c.v() === "ADD" && c.v(1) === "VALUE") {
+      const enumValuePositioned = c.t.slice(c.i).some((t) => t.kind === "word" && (t.v === "BEFORE" || t.v === "AFTER"));
+      return { kind: "alter-type", enumAddValue: true, enumValuePositioned };
+    }
+    if (c.v() === "RENAME" && c.v(1) === "VALUE") return { kind: "alter-type", renameValue: true };
     return { kind: "alter-type" };
   }
-  if (c.v() === "INDEX") return { kind: "unknown" };
+  if (c.v() === "DOMAIN") {
+    c.skip();
+    readName(c);
+    if (c.v() === "ADD" && c.v(1) !== "VALUE") {
+      const domainNotValid = /\bNOT VALID\b/.test(keywordSeq(c.t.slice(c.i)));
+      return { kind: "alter-domain", domainAddsConstraint: true, domainNotValid };
+    }
+    return { kind: "alter-domain", domainAddsConstraint: false };
+  }
+  if (c.v() === "SCHEMA") {
+    c.skip();
+    readName(c);
+    if (c.is("RENAME", "TO")) {
+      c.skip(2);
+      return { kind: "alter-schema", schemaRenameTo: readName(c) };
+    }
+    return { kind: "alter-schema" };
+  }
+  if (c.kind() === "word" && BENIGN_ALTER.has(c.v())) return { kind: "other-statement" };
   if (c.v() !== "TABLE") return { kind: "unknown" };
   c.skip();
   skipIfExists(c);
@@ -24591,15 +24923,16 @@ function parseAlter(c) {
   const named = readNameFull(c);
   const table = named?.key;
   const tableSql = named?.sql;
+  const tableQualified = (named?.parts ?? 1) > 1;
   const actions = [];
   const rest = c.t.slice(c.i);
   const groups = [];
   let cur = [];
   let depth = 0;
   for (const t of rest) {
-    if (t.v === "(") depth++;
-    if (t.v === ")") depth--;
-    if (t.v === "," && depth === 0) {
+    if (isOp(t, "(")) depth++;
+    if (isOp(t, ")")) depth--;
+    if (isOp(t, ",") && depth === 0) {
       groups.push(cur);
       cur = [];
       continue;
@@ -24611,7 +24944,7 @@ function parseAlter(c) {
     if (g.length === 0) continue;
     actions.push(parseAlterAction(new Cur(g)));
   }
-  return { kind: "alter-table", table, tableSql, actions };
+  return { kind: "alter-table", table, tableSql, tableQualified, actions };
 }
 var DEFAULT_STOPS = /* @__PURE__ */ new Set(["NOT", "NULL", "CONSTRAINT", "CHECK", "REFERENCES", "UNIQUE", "PRIMARY", "GENERATED", "COLLATE"]);
 function parseAlterAction(c) {
@@ -24623,6 +24956,7 @@ function parseAlterAction(c) {
     if (c.kind() === "word" && (c.v() === "CONSTRAINT" || ["FOREIGN", "CHECK", "UNIQUE", "PRIMARY", "EXCLUDE"].includes(c.v()))) {
       return A({ kind: "add-constraint", constraint: parseConstraint(c) });
     }
+    const addIfExists = c.is("IF", "NOT", "EXISTS");
     skipIfExists(c);
     const colNamed = readNameFull(c);
     const column = colNamed?.key;
@@ -24631,66 +24965,94 @@ function parseAlterAction(c) {
     let notNull = false;
     let hasDefault = false;
     let defaultExpr;
+    let defaultVolatile = false;
     let identity = false;
     let generatedStored = false;
+    let inlinePrimaryKey = false;
+    let inlineUnique = false;
+    let depth = 0;
     while (!c.done()) {
-      if (c.is("NOT", "NULL")) {
-        notNull = true;
-        c.skip(2);
-        continue;
-      }
-      if (c.is("NULL")) {
+      const t = c.peek();
+      if (isOp(t, "(")) {
+        depth++;
         c.skip();
         continue;
       }
-      if (c.is("DEFAULT")) {
+      if (isOp(t, ")")) {
+        if (depth > 0) depth--;
         c.skip();
-        hasDefault = true;
-        defaultExpr = readExpr(c, DEFAULT_STOPS);
         continue;
       }
-      if (c.is("PRIMARY", "KEY")) {
-        c.skip(2);
-        continue;
-      }
-      if (c.is("GENERATED")) {
-        c.skip();
-        if (c.is("ALWAYS")) c.skip();
-        else if (c.is("BY", "DEFAULT")) c.skip(2);
-        if (c.v() === "AS") c.skip();
-        if (c.v() === "IDENTITY") {
-          identity = true;
-          c.skip();
-          if (c.v() === "(") readParenGroup(c);
+      if (depth === 0) {
+        if (c.is("NOT", "NULL")) {
+          notNull = true;
+          c.skip(2);
           continue;
         }
-        if (c.v() === "(") {
-          readParenGroup(c);
-          if (c.v() === "STORED") {
-            generatedStored = true;
+        if (c.is("NULL")) {
+          c.skip();
+          continue;
+        }
+        if (c.is("DEFAULT")) {
+          c.skip();
+          hasDefault = true;
+          const defStart = c.i;
+          defaultExpr = readExpr(c, DEFAULT_STOPS);
+          defaultVolatile = defaultLooksVolatile(c.t.slice(defStart, c.i));
+          continue;
+        }
+        if (c.is("PRIMARY", "KEY")) {
+          c.skip(2);
+          notNull = true;
+          inlinePrimaryKey = true;
+          continue;
+        }
+        if (c.is("UNIQUE")) {
+          c.skip();
+          inlineUnique = true;
+          continue;
+        }
+        if (c.is("GENERATED")) {
+          c.skip();
+          if (c.is("ALWAYS")) c.skip();
+          else if (c.is("BY", "DEFAULT")) c.skip(2);
+          if (c.v() === "AS") c.skip();
+          if (c.v() === "IDENTITY") {
+            identity = true;
             c.skip();
+            if (isOp(c.peek(), "(")) readParenGroup(c);
+            continue;
+          }
+          if (isOp(c.peek(), "(")) {
+            readParenGroup(c);
+            if (c.v() === "STORED") {
+              generatedStored = true;
+              c.skip();
+            }
+            continue;
           }
           continue;
         }
-        continue;
       }
       c.skip();
     }
-    return A({ kind: "add-column", column, columnSql, typeText, notNull, hasDefault, defaultExpr, identity, generatedStored });
+    return A({ kind: "add-column", column, columnSql, typeText, notNull, hasDefault, defaultExpr, defaultVolatile, identity, generatedStored, inlinePrimaryKey, inlineUnique, ifExists: addIfExists });
   }
   if (c.is("DROP")) {
     c.skip();
     if (c.v() === "COLUMN") c.skip();
     if (c.v() === "CONSTRAINT") {
       c.skip();
+      const dcIfExists = c.is("IF", "EXISTS");
       skipIfExists(c);
-      return A({ kind: "drop-constraint", column: readName(c) });
+      return A({ kind: "drop-constraint", column: readName(c), ifExists: dcIfExists });
     }
     if (c.v() === "NOT" && c.v(1) === "NULL") return A({ kind: "drop-not-null" });
     if (c.v() === "DEFAULT") return A({ kind: "drop-default" });
+    const dropIfExists = c.is("IF", "EXISTS");
     skipIfExists(c);
     const dn = readNameFull(c);
-    return A({ kind: "drop-column", column: dn?.key, columnSql: dn?.sql });
+    return A({ kind: "drop-column", column: dn?.key, columnSql: dn?.sql, ifExists: dropIfExists });
   }
   if (c.is("ALTER")) {
     c.skip();
@@ -24706,9 +25068,10 @@ function parseAlterAction(c) {
       return A({ kind: "alter-column-type", column, columnSql, typeText, hasUsing });
     }
     if (c.is("SET", "NOT", "NULL")) return A({ kind: "set-not-null", column, columnSql });
-    if (c.is("DROP", "NOT", "NULL")) return A({ kind: "drop-not-null", column });
+    if (c.is("DROP", "NOT", "NULL")) return A({ kind: "drop-not-null", column, columnSql });
     if (c.is("SET", "DEFAULT")) return A({ kind: "set-default", column });
     if (c.is("DROP", "DEFAULT")) return A({ kind: "drop-default", column });
+    if (c.is("ADD", "GENERATED")) return A({ kind: "add-identity", column, columnSql });
     return A({ kind: "other", column });
   }
   if (c.is("VALIDATE", "CONSTRAINT")) {
@@ -24769,7 +25132,7 @@ function parseConstraint(c) {
   if (c.is("FOREIGN", "KEY")) {
     kind = "foreign-key";
     c.skip(2);
-    if (c.v() === "(") columns = tokensToColumns(readParenGroup(c));
+    if (isOp(c.peek(), "(")) columns = tokensToColumns(readParenGroup(c));
     if (c.v() === "REFERENCES") {
       c.skip();
       refTable = readName(c);
@@ -24777,80 +25140,23 @@ function parseConstraint(c) {
   } else if (c.is("CHECK")) {
     kind = "check";
     c.skip();
-    if (c.v() === "(") readParenGroup(c);
+    if (isOp(c.peek(), "(")) readParenGroup(c);
   } else if (c.is("UNIQUE")) {
     kind = "unique";
     c.skip();
-    if (c.v() === "(") columns = tokensToColumns(readParenGroup(c));
+    if (isOp(c.peek(), "(")) columns = tokensToColumns(readParenGroup(c));
   } else if (c.is("PRIMARY", "KEY")) {
     kind = "primary-key";
     c.skip(2);
-    if (c.v() === "(") columns = tokensToColumns(readParenGroup(c));
+    if (isOp(c.peek(), "(")) columns = tokensToColumns(readParenGroup(c));
   } else if (c.is("EXCLUDE")) {
     kind = "exclude";
     c.skip();
   }
-  const rest = c.t.slice(c.i).map((t) => t.v).join(" ");
-  const notValid = /\bNOT VALID\b/.test(rest);
-  const usingIndex = /\bUSING INDEX\b/.test(rest);
+  const kw = keywordSeq(c.t.slice(c.i));
+  const notValid = /\bNOT VALID\b/.test(kw);
+  const usingIndex = /\bUSING INDEX\b/.test(kw);
   return { kind, name, nameSql, notValid, usingIndex, refTable, columns };
-}
-
-// packages/engine/src/locks.ts
-var AE = (duration) => ({
-  lock: "ACCESS EXCLUSIVE",
-  blocksReads: true,
-  blocksWrites: true,
-  duration
-});
-var SHARE_ROW_EXCLUSIVE = (duration) => ({
-  lock: "SHARE ROW EXCLUSIVE",
-  blocksReads: false,
-  blocksWrites: true,
-  duration
-});
-var SHARE = (duration) => ({
-  lock: "SHARE",
-  blocksReads: false,
-  blocksWrites: true,
-  // blocks INSERT/UPDATE/DELETE; reads OK
-  duration
-});
-var VOLATILE_FNS = [
-  "CLOCK_TIMESTAMP",
-  "TIMEOFDAY",
-  "RANDOM",
-  "GEN_RANDOM_UUID",
-  "UUID_GENERATE_V1",
-  "UUID_GENERATE_V4",
-  "NEXTVAL",
-  "CURRVAL"
-];
-function isVolatileDefault(expr) {
-  if (!expr) return false;
-  const up = expr.toUpperCase();
-  return VOLATILE_FNS.some((f) => new RegExp(`\\b${f}\\s*\\(`).test(up) || up === f);
-}
-function addColumnDefaultProfile(pgVersion, volatile) {
-  if (volatile || pgVersion < 11) return { profile: AE("rewrite"), rewritesTable: true };
-  return { profile: AE("instant"), rewritesTable: false };
-}
-function typeChangeNeedsRewrite(fromHint, toType) {
-  const to = toType.toUpperCase().replace(/\s+/g, " ").trim();
-  if (/^(CHARACTER VARYING|VARCHAR)\s*\(\d+\)$/.test(to)) {
-    return false;
-  }
-  if (to === "TEXT" || to === "CHARACTER VARYING" || to === "VARCHAR") return false;
-  if (/^NUMERIC\s*\(/.test(to) || /^DECIMAL\s*\(/.test(to)) return false;
-  return true;
-}
-function setNotNullProfile() {
-  return AE("scan");
-}
-function blocksLabel(p) {
-  if (p.blocksReads && p.blocksWrites) return "ALL reads and writes";
-  if (p.blocksWrites) return "all writes (reads continue)";
-  return "no normal traffic (DDL/vacuum only)";
 }
 
 // packages/engine/src/impact.ts
@@ -25169,7 +25475,7 @@ var addColumnDefaultRule = {
         continue;
       }
       if (!a.hasDefault) continue;
-      const volatile = isVolatileDefault(a.defaultExpr);
+      const volatile = a.defaultVolatile ?? false;
       const { profile, rewritesTable } = addColumnDefaultProfile(ctx.opts.pgVersion, volatile);
       if (!rewritesTable) continue;
       ctx.report({
@@ -25190,8 +25496,10 @@ var addColumnNotNullNoDefaultRule = {
   id: "add-column-not-null-no-default",
   check(ctx) {
     if (ctx.info.kind !== "alter-table") return;
+    if (ctx.tableCreatedThisFile(ctx.info.table)) return;
     for (const a of ctx.info.actions ?? []) {
-      if (a.kind !== "add-column" || !a.notNull || a.hasDefault) continue;
+      if (a.kind !== "add-column" || !a.notNull) continue;
+      if (a.hasDefault || a.identity || a.generatedStored || SERIAL_TYPES.test((a.typeText ?? "").toUpperCase())) continue;
       const table = ctx.info.table;
       const tableSql = ctx.info.tableSql ?? table;
       const colSql = a.columnSql ?? a.column;
@@ -25212,6 +25520,7 @@ var setNotNullRule = {
   id: "set-not-null-scan",
   check(ctx) {
     if (ctx.info.kind !== "alter-table") return;
+    if (ctx.tableCreatedThisFile(ctx.info.table)) return;
     for (const a of ctx.info.actions ?? []) {
       if (a.kind !== "set-not-null") continue;
       const table = ctx.info.table;
@@ -25228,6 +25537,57 @@ var setNotNullRule = {
         impact: estimateImpact("scan", stats),
         safeHint: pg12 ? "Add CHECK (col IS NOT NULL) NOT VALID \u2192 VALIDATE (non-blocking) \u2192 SET NOT NULL (now instant) \u2192 drop the CHECK." : "Backfill NULLs in batches first; on PG12+ use the CHECK-constraint pattern to skip the scan.",
         rewrite: tableSql && colSql ? notNullRewrite(tableSql, colSql, ctx.opts.pgVersion) : void 0,
+        table
+      });
+    }
+  }
+};
+var dropNotNullRule = {
+  id: "drop-not-null",
+  check(ctx) {
+    if (ctx.info.kind !== "alter-table") return;
+    for (const a of ctx.info.actions ?? []) {
+      if (a.kind !== "drop-not-null") continue;
+      const table = ctx.info.table;
+      const colDisplay = a.columnSql ? identText(a.columnSql) : a.column ?? "column";
+      ctx.report({
+        ruleId: this.id,
+        severity: "warning",
+        title: `DROP NOT NULL on "${colDisplay}" \u2014 code that trusts this column will meet NULLs`,
+        explanation: "The drop itself is instant (catalog-only, brief ACCESS EXCLUSIVE). The damage is delayed: application code, PL/pgSQL, and queries written against a never-NULL guarantee start receiving NULLs and fail in ways no test caught. It is also a one-way door in practice \u2014 putting NOT NULL back later requires a full-table scan (or the PG 12+ CHECK-constraint dance).",
+        lock: AE("instant"),
+        safeHint: "Confirm every reader tolerates NULL first. If you only need it temporarily, prefer a CHECK constraint you can VALIDATE back later.",
+        table
+      });
+    }
+  }
+};
+function identText(sql) {
+  return sql.startsWith('"') ? sql.slice(1, -1).replace(/""/g, '"') : sql;
+}
+function strLit(v) {
+  return `'${v.replace(/'/g, "''")}'`;
+}
+var addIdentityExistingRule = {
+  id: "add-identity-existing-column",
+  check(ctx) {
+    if (ctx.info.kind !== "alter-table") return;
+    for (const a of ctx.info.actions ?? []) {
+      if (a.kind !== "add-identity") continue;
+      const table = ctx.info.table;
+      const colDisplay = identText(a.columnSql ?? a.column ?? "id");
+      const tblSql = ctx.info.tableSql ?? table ?? "the_table";
+      const colSql = a.columnSql ?? a.column ?? "id";
+      const colName = identText(colSql);
+      ctx.report({
+        ruleId: this.id,
+        severity: "warning",
+        title: `ADD GENERATED ... AS IDENTITY on existing column "${colDisplay}" \u2014 the new sequence ignores existing rows`,
+        explanation: "Making an existing column an identity column is catalog-only (no rewrite, brief ACCESS EXCLUSIVE) and existing rows keep their values \u2014 but the new sequence does not account for them (it starts at 1 unless you set START WITH). The statement also errors outright unless the column is already NOT NULL. If existing values reach the sequence, future inserts draw already-used numbers and fail with duplicate-key errors: a delayed production incident that no empty test database will ever show.",
+        lock: AE("instant"),
+        // pg_get_serial_sequence takes TEXT args (case-sensitive), so the table/column are
+        // passed as string literals, case-preserved; the SELECT itself uses SQL identifiers.
+        safeHint: `Right after adding the identity, align the sequence: SELECT setval(pg_get_serial_sequence(${strLit(tblSql)}, ${strLit(colName)}), (SELECT COALESCE(MAX(${colSql}), 0) + 1 FROM ${tblSql}), false);`,
         table
       });
     }
@@ -25281,6 +25641,7 @@ var nonConcurrentIndexRule = {
     const idx = ctx.info.index;
     if (idx.concurrently) return;
     const table = ctx.info.table;
+    if (ctx.tableCreatedThisFile(table)) return;
     const stats = ctx.tableStats(table);
     ctx.report({
       ruleId: this.id,
@@ -25322,13 +25683,13 @@ var nonConcurrentDropIndexRule = {
 var concurrentInTransactionRule = {
   id: "concurrent-index-in-transaction",
   check(ctx) {
-    const isConcurrentIdx = ctx.info.kind === "create-index" && ctx.info.index?.concurrently || ctx.info.kind === "drop-index" && ctx.info.concurrently || ctx.info.kind === "reindex" && ctx.info.concurrently;
-    if (!isConcurrentIdx || !ctx.inTransaction) return;
+    const isConcurrent = ctx.info.kind === "create-index" && ctx.info.index?.concurrently || ctx.info.kind === "drop-index" && ctx.info.concurrently || ctx.info.kind === "reindex" && ctx.info.concurrently || ctx.info.kind === "alter-table" && (ctx.info.actions ?? []).some((a) => a.kind === "detach-partition" && a.concurrently);
+    if (!isConcurrent || !ctx.inTransaction) return;
     ctx.report({
       ruleId: this.id,
       severity: "critical",
       title: "CONCURRENTLY cannot run inside a transaction \u2014 this migration will fail",
-      explanation: "CREATE/DROP INDEX CONCURRENTLY and REINDEX CONCURRENTLY refuse to run inside a transaction block. " + (ctx.explicitTxn ? "This file opens an explicit BEGIN around it, so the statement will error at deploy time (`CREATE INDEX CONCURRENTLY cannot run inside a transaction block`)." : "Your migration runner wraps files in a transaction by default, so this statement will error at deploy time (`CREATE INDEX CONCURRENTLY cannot run inside a transaction block`)."),
+      explanation: "CREATE/DROP INDEX CONCURRENTLY, REINDEX CONCURRENTLY, and DETACH PARTITION CONCURRENTLY refuse to run inside a transaction block. " + (ctx.explicitTxn ? "This file opens an explicit BEGIN around it, so the statement will error at deploy time (`CREATE INDEX CONCURRENTLY cannot run inside a transaction block`)." : "Your migration runner wraps files in a transaction by default, so this statement will error at deploy time (`CREATE INDEX CONCURRENTLY cannot run inside a transaction block`)."),
       safeHint: ctx.explicitTxn ? "Remove the BEGIN/COMMIT around this statement, or move it to its own non-transactional migration." : "Move it to its own migration with the transaction wrapper disabled (e.g. `disable_ddl_transaction!` in Rails, `atomic = False` in Django, `-- +goose NO TRANSACTION`, or your framework's equivalent).",
       table: ctx.info.table
     });
@@ -25401,41 +25762,125 @@ var uniqueDirectRule = {
   id: "unique-constraint-direct",
   check(ctx) {
     if (ctx.info.kind !== "alter-table") return;
+    const table = ctx.info.table;
+    if (ctx.tableCreatedThisFile(table)) return;
+    const stats = ctx.tableStats(table);
+    const fire = (columns, name, inline) => ctx.report({
+      ruleId: this.id,
+      severity: "critical",
+      title: inline ? "Inline UNIQUE column builds its index under an exclusive lock" : "UNIQUE constraint builds its index under an exclusive lock",
+      explanation: `${inline ? "`ADD COLUMN ... UNIQUE`" : "`ADD CONSTRAINT ... UNIQUE`"} builds the backing unique index while holding ACCESS EXCLUSIVE on ${table ?? "the table"} \u2014 all reads and writes are blocked for the entire index build.`,
+      lock: AE("index-build"),
+      impact: estimateImpact("index-build", stats),
+      safeHint: "Add the column without the constraint, CREATE UNIQUE INDEX CONCURRENTLY, then ADD CONSTRAINT ... UNIQUE USING INDEX (instant adoption).",
+      rewrite: !inline && table ? uniqueViaIndexRewrite(ctx.info.tableSql ?? table, columns, name) : void 0,
+      table
+    });
     for (const a of ctx.info.actions ?? []) {
-      if (a.kind !== "add-constraint" || a.constraint?.kind !== "unique" || a.constraint.usingIndex) continue;
+      if (a.kind === "add-constraint" && a.constraint?.kind === "unique" && !a.constraint.usingIndex) {
+        fire(a.constraint.columns, a.constraint.nameSql ?? a.constraint.name, false);
+      } else if (a.kind === "add-column" && a.inlineUnique) {
+        fire(a.columnSql ?? a.column, void 0, true);
+      }
+    }
+  }
+};
+var excludeConstraintRule = {
+  id: "exclude-constraint-blocking",
+  check(ctx) {
+    if (ctx.info.kind !== "alter-table") return;
+    for (const a of ctx.info.actions ?? []) {
+      if (a.kind !== "add-constraint" || a.constraint?.kind !== "exclude") continue;
       const table = ctx.info.table;
       const stats = ctx.tableStats(table);
       ctx.report({
         ruleId: this.id,
         severity: "critical",
-        title: "UNIQUE constraint builds its index under an exclusive lock",
-        explanation: `\`ADD CONSTRAINT ... UNIQUE\` builds the backing unique index while holding ACCESS EXCLUSIVE on ${table ?? "the table"} \u2014 all reads and writes are blocked for the entire index build.`,
+        title: "EXCLUDE constraint builds its index under a full exclusive lock \u2014 and has no online escape hatch",
+        explanation: `\`ADD CONSTRAINT ... EXCLUDE\` builds the backing (typically GiST) index while holding ACCESS EXCLUSIVE on ${table ?? "the table"} \u2014 all reads and writes are blocked for the entire build. Unlike CHECK and FK constraints there is no NOT VALID option, no USING INDEX adoption, and no CONCURRENTLY variant: Postgres offers no online path for exclusion constraints on any version.`,
         lock: AE("index-build"),
         impact: estimateImpact("index-build", stats),
-        safeHint: "CREATE UNIQUE INDEX CONCURRENTLY first, then ADD CONSTRAINT ... UNIQUE USING INDEX (instant adoption).",
-        rewrite: table ? uniqueViaIndexRewrite(ctx.info.tableSql ?? table, a.constraint.columns, a.constraint.nameSql ?? a.constraint.name) : void 0,
+        safeHint: "Plan a maintenance window with lock_timeout set. If the exclusion is over equality only, a unique index (buildable CONCURRENTLY) may serve instead.",
         table
       });
     }
+  }
+};
+var dropConstraintRule = {
+  id: "drop-constraint-lock",
+  check(ctx) {
+    if (ctx.info.kind !== "alter-table") return;
+    for (const a of ctx.info.actions ?? []) {
+      if (a.kind !== "drop-constraint") continue;
+      if (a.column && ctx.constraintsAddedThisFile.has(a.column)) continue;
+      const table = ctx.info.table;
+      ctx.report({
+        ruleId: this.id,
+        severity: "warning",
+        title: `DROP CONSTRAINT "${a.column ?? ""}" \u2014 brief full lock, and for FKs it locks the referenced table too`,
+        explanation: `Dropping a constraint takes a brief ACCESS EXCLUSIVE on ${table ?? "the table"} (queue-pileup risk applies). If it's a foreign key, Postgres also locks the REFERENCED table exclusively \u2014 the asymmetric surprise: adding an FK takes SHARE ROW EXCLUSIVE, dropping it freezes both tables outright. And the integrity guarantee the constraint enforced is gone the moment it commits.`,
+        lock: AE("instant"),
+        safeHint: "Set lock_timeout first. For FK drops, treat BOTH tables as briefly frozen and schedule accordingly. Be sure nothing still relies on the guarantee.",
+        table
+      });
+    }
+  }
+};
+var domainConstraintRule = {
+  id: "domain-constraint",
+  check(ctx) {
+    if (ctx.info.kind === "create-domain" && ctx.info.domainHasConstraint) {
+      ctx.report({
+        ruleId: this.id,
+        severity: "info",
+        title: "CREATE DOMAIN with a constraint \u2014 poor online-migration support later",
+        explanation: "Creating the domain is instant, but any future change to its constraint revalidates every column using the domain across every table, and Postgres treats coercion to a constrained domain as requiring a rewrite. Constraints on domains are a long-term tax on every migration that touches them.",
+        safeHint: "Put the constraint on the columns that need it instead of on the domain."
+      });
+      return;
+    }
+    if (ctx.info.kind !== "alter-domain" || !ctx.info.domainAddsConstraint) return;
+    if (ctx.info.domainNotValid) {
+      ctx.report({
+        ruleId: this.id,
+        severity: "info",
+        title: "ALTER DOMAIN ... ADD CONSTRAINT NOT VALID \u2014 right pattern, domain-sized caveats",
+        explanation: "NOT VALID skips the immediate database-wide validation scan \u2014 the right call. Remember VALIDATE CONSTRAINT later, and note the docs' own caveat: the eager check is not bulletproof against concurrently-inserted rows (commit, wait out older transactions, then validate). It also fails outright if the domain is used inside any composite, array, or range column anywhere in the database.",
+        safeHint: "Commit the NOT VALID constraint, wait for pre-commit transactions to finish, then ALTER DOMAIN ... VALIDATE CONSTRAINT."
+      });
+      return;
+    }
+    ctx.report({
+      ruleId: this.id,
+      severity: "critical",
+      title: "ALTER DOMAIN ... ADD CONSTRAINT validates every table using the domain \u2014 database-wide scan",
+      explanation: "Adding a domain constraint without NOT VALID checks every column of every table that uses the domain, across the whole database, before it completes. The cost scales with ALL tables using the domain, not one \u2014 a domain used in ten tables means ten validation scans in one statement.",
+      safeHint: "ADD CONSTRAINT ... NOT VALID (instant), then ALTER DOMAIN ... VALIDATE CONSTRAINT after older transactions have finished."
+    });
   }
 };
 var pkDirectRule = {
   id: "add-primary-key-direct",
   check(ctx) {
     if (ctx.info.kind !== "alter-table") return;
+    const table = ctx.info.table;
+    if (ctx.tableCreatedThisFile(table)) return;
+    const stats = ctx.tableStats(table);
     for (const a of ctx.info.actions ?? []) {
-      if (a.kind !== "add-constraint" || a.constraint?.kind !== "primary-key" || a.constraint.usingIndex) continue;
-      const table = ctx.info.table;
-      const stats = ctx.tableStats(table);
+      const isAddConstraintPk = a.kind === "add-constraint" && a.constraint?.kind === "primary-key" && !a.constraint.usingIndex;
+      const isInlinePkWithDefault = a.kind === "add-column" && a.inlinePrimaryKey && a.hasDefault;
+      if (!isAddConstraintPk && !isInlinePkWithDefault) continue;
+      const cols = isAddConstraintPk ? a.constraint.columns : a.columnSql ?? a.column;
+      const name = isAddConstraintPk ? a.constraint.nameSql ?? a.constraint.name : void 0;
       ctx.report({
         ruleId: this.id,
         severity: "critical",
         title: "PRIMARY KEY builds its index under an exclusive lock",
-        explanation: `\`ADD PRIMARY KEY\` builds the unique index under ACCESS EXCLUSIVE on ${table ?? "the table"} \u2014 everything is blocked for the whole build (it may also add NOT NULL validation scans on the key columns).`,
+        explanation: `${isInlinePkWithDefault ? "`ADD COLUMN ... PRIMARY KEY`" : "`ADD PRIMARY KEY`"} builds the unique index under ACCESS EXCLUSIVE on ${table ?? "the table"} \u2014 everything is blocked for the whole build (it may also add NOT NULL validation scans on the key columns).`,
         lock: AE("index-build"),
         impact: estimateImpact("index-build", stats),
         safeHint: "CREATE UNIQUE INDEX CONCURRENTLY, then ADD CONSTRAINT ... PRIMARY KEY USING INDEX.",
-        rewrite: table ? pkViaIndexRewrite(ctx.info.tableSql ?? table, a.constraint.columns, a.constraint.nameSql ?? a.constraint.name) : void 0,
+        rewrite: isAddConstraintPk && table ? pkViaIndexRewrite(ctx.info.tableSql ?? table, cols, name) : void 0,
         table
       });
     }
@@ -25496,6 +25941,16 @@ var truncateRule = {
 var renameRule = {
   id: "rename-breaks-code",
   check(ctx) {
+    if (ctx.info.kind === "alter-schema" && ctx.info.schemaRenameTo) {
+      ctx.report({
+        ruleId: this.id,
+        severity: "warning",
+        title: `Renaming a schema to "${ctx.info.schemaRenameTo}" breaks every qualified reference in running code`,
+        explanation: "The rename is instant, but every already-running app instance still queries the old schema name \u2014 every schema-qualified query, view definition referenced by name, and search_path entry breaks at once. Under rolling deploys there is ALWAYS a window where both app versions run.",
+        safeHint: "Avoid renaming live schemas. If unavoidable: coordinate an all-at-once deploy, or stage access through an updated search_path first."
+      });
+      return;
+    }
     if (ctx.info.kind !== "alter-table") return;
     for (const a of ctx.info.actions ?? []) {
       if (a.kind !== "rename-column" && a.kind !== "rename-table") continue;
@@ -25549,8 +26004,39 @@ var vacuumFullRule = {
       explanation: `${verb} rewrites the entire table while holding ACCESS EXCLUSIVE \u2014 nothing can read or write until it finishes. It should essentially never appear in a migration; use pg_repack (online) if you need to reclaim space.`,
       lock: AE("rewrite"),
       impact: estimateImpact("rewrite", stats),
-      safeHint: "Plain VACUUM (no FULL) never blocks. For bloat reclamation use pg_repack, which works online.",
+      safeHint: ctx.opts.pgVersion >= 19 ? "Plain VACUUM (no FULL) never blocks. PG 19 adds REPACK (with a CONCURRENTLY option) as the built-in online successor; pg_repack also works online." : "Plain VACUUM (no FULL) never blocks. For bloat reclamation use pg_repack, which works online.",
       table: ctx.info.table
+    });
+  }
+};
+var createTriggerRule = {
+  id: "create-trigger-lock",
+  check(ctx) {
+    if (ctx.info.kind !== "create-trigger") return;
+    const table = ctx.info.table;
+    if (ctx.tableCreatedThisFile(table)) return;
+    const shown = ctx.info.tableSql ?? table ?? "the table";
+    ctx.report({
+      ruleId: this.id,
+      severity: "warning",
+      title: "CREATE TRIGGER blocks all writes while it runs \u2014 brief, but it queues",
+      explanation: `CREATE TRIGGER takes SHARE ROW EXCLUSIVE on ${shown}: every INSERT, UPDATE and DELETE blocks until it completes (reads continue). The operation itself is a fast catalog change \u2014 the real risk is the queue: it must WAIT behind any long-running write, and every write then queues behind it.`,
+      lock: SHARE_ROW_EXCLUSIVE("instant"),
+      safeHint: "SET lock_timeout = '5s' first so a busy table makes this fail fast and retryable instead of freezing writes behind a stuck queue.",
+      table
+    });
+  }
+};
+var enumRenameValueRule = {
+  id: "enum-value-rename",
+  check(ctx) {
+    if (ctx.info.kind !== "alter-type" || !ctx.info.renameValue) return;
+    ctx.report({
+      ruleId: this.id,
+      severity: "warning",
+      title: "ALTER TYPE ... RENAME VALUE \u2014 the old label becomes invalid input the moment it commits",
+      explanation: "The rename is metadata-only and transaction-safe (existing rows are untouched \u2014 they store the enum internally, not the label). But every running app instance still sends the old label, and those INSERTs/UPDATEs start erroring the instant the rename commits. Under rolling deploys there is ALWAYS a window where old code runs.",
+      safeHint: "Coordinate the rename with an all-at-once deploy, or expand/contract: add the new value, migrate code to write it, then retire the old one."
     });
   }
 };
@@ -25622,12 +26108,14 @@ var lockTableRule = {
   id: "explicit-lock-table",
   check(ctx) {
     if (ctx.info.kind !== "lock-table") return;
+    const mode = ctx.info.lockMode;
+    const isAE = mode === void 0 || mode === "ACCESS EXCLUSIVE";
     ctx.report({
       ruleId: this.id,
       severity: "warning",
-      title: `Explicit LOCK TABLE ${ctx.info.table ?? ""}`,
-      explanation: "LOCK TABLE defaults to ACCESS EXCLUSIVE and holds it until the transaction ends \u2014 everything queues behind the rest of this migration. Occasionally legitimate, usually a sledgehammer.",
-      lock: AE("instant"),
+      title: isAE ? `Explicit LOCK TABLE ${ctx.info.table ?? ""} (ACCESS EXCLUSIVE)` : `Explicit LOCK TABLE ${ctx.info.table ?? ""} IN ${mode} MODE`,
+      explanation: isAE ? "LOCK TABLE defaults to ACCESS EXCLUSIVE and holds it until the transaction ends \u2014 everything (reads included) queues behind the rest of this migration. Occasionally legitimate, usually a sledgehammer." : `LOCK TABLE ... IN ${mode} MODE holds that lock until the transaction ends. It is weaker than ACCESS EXCLUSIVE (it does not block all reads), but it still serializes behind and ahead of concurrent traffic for the rest of the transaction \u2014 keep the transaction short.`,
+      lock: isAE ? AE("instant") : void 0,
       safeHint: "If you truly need it, take the weakest lock mode that works and keep the transaction as short as possible.",
       table: ctx.info.table
     });
@@ -25635,12 +26123,12 @@ var lockTableRule = {
 };
 
 // packages/engine/src/rules/hygiene.ts
+var DDL_KINDS = /* @__PURE__ */ new Set(["alter-table", "create-index", "drop-index", "drop-table", "truncate", "reindex", "cluster", "lock-table"]);
 var noLockTimeoutRule = {
   id: "no-lock-timeout",
   check(ctx) {
     if (ctx.lockTimeoutSet) return;
-    const ddlKinds = /* @__PURE__ */ new Set(["alter-table", "create-index", "drop-index", "drop-table", "truncate", "reindex", "cluster", "lock-table"]);
-    if (!ddlKinds.has(ctx.info.kind)) return;
+    if (!DDL_KINDS.has(ctx.info.kind)) return;
     ctx.report({
       ruleId: this.id,
       severity: "warning",
@@ -25676,22 +26164,43 @@ var enumInTransactionRule = {
     });
   }
 };
+var PK_32BIT = /* @__PURE__ */ new Set(["INTEGER", "INT", "INT4", "SERIAL", "SERIAL4"]);
+var PK_16BIT = /* @__PURE__ */ new Set(["SMALLINT", "INT2", "SMALLSERIAL", "SERIAL2"]);
+var NARROW_SERIAL = /^(SMALLSERIAL|SERIAL2|SERIAL4|SERIAL)$/;
 var preferBigintPkRule = {
   id: "prefer-bigint-pk",
   check(ctx) {
-    if (ctx.info.kind !== "create-table") return;
-    for (const col of ctx.info.columns ?? []) {
-      const t = col.typeText.toUpperCase();
-      const isIntPk = col.isPrimaryKey && (t === "INTEGER" || t === "INT" || t === "INT4" || t === "SERIAL");
-      if (!isIntPk) continue;
-      ctx.report({
-        ruleId: this.id,
-        severity: "info",
-        title: `Primary key "${col.name}" is 32-bit \u2014 it will run out`,
-        explanation: "int4 tops out at ~2.1 billion. Busy tables hit it (Basecamp, Sentry and plenty of others have written the postmortem), and the emergency int\u2192bigint migration on a huge table is exactly the rewrite nightmare Landsafe exists to prevent. Starting with bigint costs nothing today.",
-        safeHint: "Use BIGINT GENERATED ALWAYS AS IDENTITY (or bigserial) for primary keys.",
-        table: ctx.info.table
-      });
+    if (ctx.info.kind === "create-table") {
+      for (const col of ctx.info.columns ?? []) {
+        const t = col.typeText.toUpperCase();
+        if (!col.isPrimaryKey || !PK_32BIT.has(t) && !PK_16BIT.has(t)) continue;
+        const small = PK_16BIT.has(t);
+        ctx.report({
+          ruleId: this.id,
+          severity: "info",
+          title: `Primary key "${col.name}" is ${small ? "16" : "32"}-bit \u2014 it will run out`,
+          explanation: small ? "smallint tops out at 32,767 \u2014 and the ceiling is total inserts ever, not live rows, since sequences never reuse gaps. When it hits, every INSERT fails, and the emergency type change is a full-table rewrite." : "int4 tops out at ~2.1 billion. Busy tables hit it (Basecamp, Sentry and plenty of others have written the postmortem), and the emergency int\u2192bigint migration on a huge table is exactly the rewrite nightmare Landsafe exists to prevent. Starting with bigint costs nothing today.",
+          safeHint: "Use BIGINT GENERATED ALWAYS AS IDENTITY (or bigserial) for primary keys.",
+          table: ctx.info.table
+        });
+      }
+      return;
+    }
+    if (ctx.info.kind === "alter-table") {
+      for (const a of ctx.info.actions ?? []) {
+        if (a.kind !== "add-column") continue;
+        const t = (a.typeText ?? "").toUpperCase();
+        if (!NARROW_SERIAL.test(t)) continue;
+        const small = t.startsWith("SMALL") || t === "SERIAL2";
+        ctx.report({
+          ruleId: this.id,
+          severity: "info",
+          title: `"${a.column}" is ${t.toLowerCase()} \u2014 a ${small ? "16" : "32"}-bit auto-increment will run out`,
+          explanation: `Sequences only count up, so an auto-incremented ${t.toLowerCase()} column exhausts at ${small ? "32,767" : "~2.1 billion"} total inserts regardless of how many rows survive. The fix later is a type change \u2014 a full-table rewrite.`,
+          safeHint: "Use bigserial / BIGINT GENERATED ALWAYS AS IDENTITY.",
+          table: ctx.info.table
+        });
+      }
     }
   }
 };
@@ -25718,7 +26227,7 @@ var preferTimestamptzRule = {
     const cols = ctx.info.kind === "create-table" ? (ctx.info.columns ?? []).map((c) => ({ name: c.name, type: c.typeText })) : ctx.info.kind === "alter-table" ? (ctx.info.actions ?? []).filter((a) => a.kind === "add-column" && a.typeText).map((a) => ({ name: a.column, type: a.typeText })) : [];
     for (const col of cols) {
       const t = col.type.toUpperCase();
-      const noTz = t === "TIMESTAMP" || t.startsWith("TIMESTAMP(") || t.includes("WITHOUT TIME ZONE");
+      const noTz = (t === "TIMESTAMP" || t.startsWith("TIMESTAMP(") || t.includes("WITHOUT TIME ZONE")) && !t.includes("WITH TIME ZONE");
       if (!noTz) continue;
       ctx.report({
         ruleId: this.id,
@@ -25749,6 +26258,230 @@ var banCharRule = {
     }
   }
 };
+var noStatementTimeoutRule = {
+  id: "no-statement-timeout",
+  check(ctx) {
+    if (ctx.statementTimeoutSet) return;
+    if (!DDL_KINDS.has(ctx.info.kind)) return;
+    ctx.report({
+      ruleId: this.id,
+      severity: "info",
+      title: "DDL without statement_timeout \u2014 a slow operation can run unbounded",
+      explanation: "lock_timeout bounds how long you WAIT for a lock; statement_timeout bounds how long the statement itself may RUN once it has the lock. A validation scan or index build that turns out bigger than expected will otherwise hold its locks for as long as it takes.",
+      safeHint: "SET statement_timeout = '60s'; before the DDL (keep lock_timeout well below it so lock waits still fail first)."
+    });
+  }
+};
+var VARCHAR_N = /^(CHARACTER VARYING|VARCHAR)\s*\(/;
+function stripCatalog(type) {
+  return type.replace(/^pg_catalog\s*\.\s*/i, "");
+}
+function typedColumns(ctx) {
+  return ctx.info.kind === "create-table" ? (ctx.info.columns ?? []).map((c) => ({ name: c.name, type: stripCatalog(c.typeText) })) : ctx.info.kind === "alter-table" ? (ctx.info.actions ?? []).filter((a) => (a.kind === "add-column" || a.kind === "alter-column-type") && a.typeText).map((a) => ({ name: a.column ?? "", type: stripCatalog(a.typeText) })) : [];
+}
+var preferTextRule = {
+  id: "prefer-text",
+  check(ctx) {
+    for (const col of typedColumns(ctx)) {
+      if (!VARCHAR_N.test(col.type.toUpperCase())) continue;
+      ctx.report({
+        ruleId: this.id,
+        severity: "info",
+        title: `"${col.name}" is ${col.type.toLowerCase()} \u2014 the length cap is a future migration`,
+        explanation: "varchar(n) hard-codes a limit into the schema. Raising it later is catalog-only (since PG 9.2) but still takes a brief ACCESS EXCLUSIVE plus a deploy; shrinking it rewrites the whole table and its indexes. text with a CHECK (length(col) <= n) constraint enforces the same limit and can be changed online via NOT VALID \u2192 VALIDATE.",
+        safeHint: "Use text plus CHECK (length(col) <= n) \u2014 add the CHECK as NOT VALID, then VALIDATE.",
+        table: ctx.info.table
+      });
+    }
+  }
+};
+var preferJsonbRule = {
+  id: "prefer-jsonb",
+  check(ctx) {
+    for (const col of typedColumns(ctx)) {
+      if (col.type.toUpperCase() !== "JSON") continue;
+      ctx.report({
+        ruleId: this.id,
+        severity: "info",
+        title: `"${col.name}" is json \u2014 stored as text, reparsed on every use, not indexable`,
+        explanation: "json stores the exact input text and reparses it on every operation; it cannot be GIN-indexed. jsonb stores decomposed binary \u2014 slightly slower to write, significantly faster to query, and indexable. The Postgres docs themselves recommend jsonb for most applications.",
+        safeHint: "Use jsonb unless you specifically need byte-exact round-tripping (key order, duplicate keys, whitespace).",
+        table: ctx.info.table
+      });
+    }
+  }
+};
+var enumValueOrderingRule = {
+  id: "enum-value-ordering",
+  check(ctx) {
+    if (ctx.info.kind !== "alter-type" || !ctx.info.enumAddValue || ctx.info.enumValuePositioned) return;
+    ctx.report({
+      ruleId: this.id,
+      severity: "info",
+      title: "ADD VALUE without BEFORE/AFTER appends to the end of the enum",
+      explanation: "Enum values have a defined order, and comparisons like status < 'approved' use it. A value appended at the end sorts after everything \u2014 if the enum's order is meaningful (workflow stages, severities), queries relying on it silently change meaning rather than erroring.",
+      safeHint: "State the position explicitly: ALTER TYPE ... ADD VALUE 'pending' BEFORE 'approved';"
+    });
+  }
+};
+var MAX_IDENT_BYTES = 63;
+var IDENT_BYTES = new TextEncoder();
+var CREATES_IDENTIFIERS = /* @__PURE__ */ new Set([
+  "create-table",
+  "create-table-as",
+  "create-index",
+  "alter-table",
+  "drop-index",
+  "drop-table",
+  "create-trigger",
+  "create-domain",
+  "alter-domain",
+  "alter-type",
+  "alter-schema",
+  "drop-type"
+]);
+var identifierTooLongRule = {
+  id: "identifier-too-long",
+  check(ctx) {
+    if (!CREATES_IDENTIFIERS.has(ctx.info.kind)) return;
+    const seen = /* @__PURE__ */ new Set();
+    for (const tok of tokenize(ctx.stmt.text, ctx.stmt.line)) {
+      if (tok.kind !== "word" && tok.kind !== "qident") continue;
+      const ident = tok.kind === "qident" ? tok.v : tok.raw ?? tok.v;
+      if (IDENT_BYTES.encode(ident).length <= MAX_IDENT_BYTES) continue;
+      const identity = tok.kind === "qident" ? ident : ident.toLowerCase();
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      ctx.report({
+        ruleId: this.id,
+        severity: "warning",
+        title: `Identifier "${ident.slice(0, 40)}${ident.length > 40 ? "\u2026" : ""}" exceeds 63 bytes \u2014 Postgres will truncate it`,
+        explanation: "Postgres keeps only the first 63 bytes of an identifier and says so only in a NOTICE nobody reads in CI. The name you wrote is not the name Postgres uses: later references may miss it, and two long names sharing a 63-byte prefix silently collapse into the SAME object \u2014 DDL then hits the wrong one.",
+        line: tok.line,
+        safeHint: "Shorten the name (ORMs generate these \u2014 override the generated index/constraint name).",
+        table: ctx.info.table
+      });
+    }
+  }
+};
+var SCHEMA_SCOPED_KINDS = /* @__PURE__ */ new Set(["create-table", "create-table-as", "alter-table", "drop-table"]);
+var unqualifiedTableRule = {
+  id: "unqualified-table-name",
+  check(ctx) {
+    if (!SCHEMA_SCOPED_KINDS.has(ctx.info.kind)) return;
+    if (ctx.info.temp) return;
+    const table = ctx.info.table;
+    if (!table) return;
+    if (ctx.info.tableQualified) return;
+    const shown = ctx.info.tableSql ?? table;
+    ctx.report({
+      ruleId: this.id,
+      severity: "info",
+      title: `${shown} is not schema-qualified \u2014 resolution depends on search_path`,
+      explanation: "Without an explicit schema, Postgres resolves the name through search_path at run time \u2014 which table this statement actually touches depends on session configuration, not on the migration text. Reported once per file.",
+      safeHint: "Write schema.table (e.g. public.users) in DDL.",
+      table
+    });
+  }
+};
+
+// packages/engine/src/rules/transactions.ts
+var transactionNestingRule = {
+  id: "transaction-nesting",
+  check(ctx) {
+    if (ctx.info.kind === "begin" && ctx.explicitTxn) {
+      ctx.report({
+        ruleId: this.id,
+        severity: "warning",
+        title: "BEGIN inside an open transaction \u2014 Postgres warns and ignores it",
+        explanation: "There are no nested transactions: this BEGIN is a no-op WARNING, and the next COMMIT ends the OUTER transaction \u2014 everything after it runs non-atomically, each statement committing on its own. The file's transaction structure does not mean what it appears to mean.",
+        safeHint: "Remove the extra BEGIN (use SAVEPOINT if you want a partial rollback point)."
+      });
+      return;
+    }
+    if (ctx.info.kind === "commit" && !ctx.explicitTxn) {
+      ctx.report({
+        ruleId: this.id,
+        severity: "warning",
+        title: ctx.opts.assumeTransaction ? "COMMIT without a BEGIN \u2014 this ends the transaction your migration runner manages" : "COMMIT/ROLLBACK without an open transaction",
+        explanation: ctx.opts.assumeTransaction ? "Your migration runner wraps this file in its own transaction. A bare COMMIT ends the RUNNER's transaction early: everything after it runs outside any transaction and survives even if a later statement fails \u2014 the file is no longer atomic." : "There is no open transaction at this point \u2014 Postgres warns and does nothing. Either a BEGIN is missing above, or this COMMIT is left over from an edit.",
+        safeHint: "Balance BEGIN/COMMIT exactly, or remove explicit transaction control and let the runner manage it."
+      });
+    }
+  }
+};
+var robustStatementsRule = {
+  id: "prefer-robust-statements",
+  check(ctx) {
+    const info2 = ctx.info;
+    if (info2.kind === "create-index" && info2.index?.concurrently && info2.index.name && !info2.ifExists) {
+      ctx.report({
+        ruleId: this.id,
+        severity: "info",
+        title: "CREATE INDEX CONCURRENTLY without IF NOT EXISTS \u2014 a failed build blocks the retry",
+        explanation: 'If a concurrent build fails (timeout, deadlock, constraint violation) it leaves an INVALID index under this name. The rerun then dies with "already exists" \u2014 and adding IF NOT EXISTS later would silently succeed against the INVALID leftover. Guard it now, and drop the INVALID index on failure.',
+        safeHint: "CREATE INDEX CONCURRENTLY IF NOT EXISTS ... \u2014 and on failure, DROP INDEX the INVALID leftover before retrying.",
+        table: info2.table
+      });
+      return;
+    }
+    if (info2.kind === "drop-index" && info2.concurrently && !info2.ifExists) {
+      ctx.report({
+        ruleId: this.id,
+        severity: "info",
+        title: "DROP INDEX CONCURRENTLY without IF EXISTS \u2014 the retry fails after a partial success",
+        explanation: 'A rerun of this file after the drop succeeded dies with "does not exist". IF EXISTS makes it rerunnable.',
+        safeHint: "DROP INDEX CONCURRENTLY IF EXISTS ...",
+        table: info2.table
+      });
+      return;
+    }
+    if (ctx.inTransaction) return;
+    const fire = (title, hint) => ctx.report({
+      ruleId: this.id,
+      severity: "info",
+      title,
+      explanation: 'This file runs outside a transaction, so a failure partway leaves earlier statements applied. On retry, this unguarded statement errors ("already exists" / "does not exist") and the migration wedges \u2014 rerunnable statements need IF [NOT] EXISTS.',
+      safeHint: hint,
+      table: info2.table
+    });
+    if (info2.kind === "create-table" && !info2.ifExists && !info2.temp) {
+      fire("CREATE TABLE without IF NOT EXISTS is not rerunnable", "CREATE TABLE IF NOT EXISTS ...");
+    } else if (info2.kind === "create-index" && info2.index?.name && !info2.ifExists) {
+      fire("CREATE INDEX without IF NOT EXISTS is not rerunnable", "CREATE INDEX IF NOT EXISTS ...");
+    } else if ((info2.kind === "drop-table" || info2.kind === "drop-index" || info2.kind === "drop-type") && !info2.ifExists) {
+      fire(`${info2.kind === "drop-table" ? "DROP TABLE" : info2.kind === "drop-index" ? "DROP INDEX" : "DROP TYPE"} without IF EXISTS is not rerunnable`, "Add IF EXISTS.");
+    } else if (info2.kind === "alter-table") {
+      for (const a of info2.actions ?? []) {
+        if (a.kind === "add-column" && !a.ifExists) {
+          fire(`ADD COLUMN "${a.column}" without IF NOT EXISTS is not rerunnable`, "ADD COLUMN IF NOT EXISTS ...");
+          return;
+        }
+        if ((a.kind === "drop-column" || a.kind === "drop-constraint") && !a.ifExists) {
+          fire(`${a.kind === "drop-column" ? "DROP COLUMN" : "DROP CONSTRAINT"} "${a.column}" without IF EXISTS is not rerunnable`, "Add IF EXISTS.");
+          return;
+        }
+        if (a.kind === "add-constraint" && a.constraint?.name && !ctx.constraintsDroppedThisFile.has(a.constraint.name)) {
+          fire(`ADD CONSTRAINT "${a.constraint.name}" is not rerunnable outside a transaction`, 'Precede it with DROP CONSTRAINT IF EXISTS "same_name", or wrap the file in a transaction.');
+          return;
+        }
+      }
+    }
+  }
+};
+var unrecognizedStatementRule = {
+  id: "unrecognized-statement",
+  check(ctx) {
+    if (ctx.info.kind !== "unknown") return;
+    ctx.report({
+      ruleId: this.id,
+      severity: "info",
+      title: "Statement not recognized \u2014 no rules ran on it",
+      explanation: "Landsafe's parser did not recognize this statement (unusual DDL, a syntax error, or a parser gap). No lock analysis applies to it \u2014 review it manually. Landsafe reports this instead of skipping silently so a parser gap can never masquerade as a clean bill of health.",
+      safeHint: "If this is valid SQL that Landsafe should understand, please open an issue with the statement."
+    });
+  }
+};
 
 // packages/engine/src/rules/index.ts
 var ALL_RULES = [
@@ -25765,6 +26498,9 @@ var ALL_RULES = [
   checkWithoutNotValidRule,
   uniqueDirectRule,
   pkDirectRule,
+  excludeConstraintRule,
+  domainConstraintRule,
+  createTriggerRule,
   vacuumFullRule,
   lockTableRule,
   detachPartitionRule,
@@ -25776,18 +26512,35 @@ var ALL_RULES = [
   renameRule,
   unboundedDmlRule,
   dropDatabaseRule,
+  dropNotNullRule,
+  dropConstraintRule,
+  enumRenameValueRule,
+  addIdentityExistingRule,
+  // Transaction structure / rerunnability
+  transactionNestingRule,
+  robustStatementsRule,
+  unrecognizedStatementRule,
   // Hygiene / correctness / quality
   noLockTimeoutRule,
+  noStatementTimeoutRule,
   enumInTransactionRule,
+  enumValueOrderingRule,
+  identifierTooLongRule,
+  unqualifiedTableRule,
   preferBigintPkRule,
   preferIdentityRule,
   preferTimestamptzRule,
-  banCharRule
+  banCharRule,
+  preferTextRule,
+  preferJsonbRule
 ];
 
 // packages/engine/src/analyze.ts
 var ENGINE_VERSION = "0.1.0";
 var SEVERITY_ORDER = { critical: 0, warning: 1, info: 2 };
+function normTableKey(table) {
+  return table.includes(".") ? table : `public.${table}`;
+}
 function lookupStats(snapshot, table) {
   if (!snapshot || !table) return void 0;
   const t = table.toLowerCase();
@@ -25815,33 +26568,59 @@ function analyzeFiles(files, options = {}) {
   let statements = 0;
   for (const file of files) {
     const stmts = splitStatements(file.content);
+    const parsed = stmts.map((stmt) => ({ stmt, info: parseStatement(stmt.text, stmt.line) }));
+    const tablesCreatedThisFile = /* @__PURE__ */ new Set();
+    const constraintsDroppedThisFile = /* @__PURE__ */ new Set();
+    const constraintsAddedThisFile = /* @__PURE__ */ new Set();
+    for (const { info: info2 } of parsed) {
+      if ((info2.kind === "create-table" || info2.kind === "create-table-as") && info2.table) tablesCreatedThisFile.add(normTableKey(info2.table));
+      if (info2.kind === "alter-table") {
+        for (const a of info2.actions ?? []) {
+          if (a.kind === "add-constraint" && a.constraint?.name) constraintsAddedThisFile.add(a.constraint.name);
+          if (a.kind === "drop-constraint" && a.column) constraintsDroppedThisFile.add(a.column);
+        }
+      }
+    }
+    const tableCreatedThisFile = (table) => table !== void 0 && tablesCreatedThisFile.has(normTableKey(table));
     let inExplicitTxn = false;
     let sawExplicitTxn = false;
     let lockTimeoutSet = false;
-    const exclusiveTables = /* @__PURE__ */ new Set();
-    for (const stmt of stmts) {
+    let statementTimeoutSet = false;
+    let openLine = 1;
+    let openText = "BEGIN;";
+    let openedByChain = false;
+    let openedByRollbackChain = false;
+    let txnExclusive = /* @__PURE__ */ new Set();
+    let txnExclusiveLine = 1;
+    const flushMultiLock = () => {
+      if (txnExclusive.size >= 3) {
+        findings.push({
+          ruleId: "many-exclusive-locks-one-transaction",
+          severity: "warning",
+          title: `This transaction takes exclusive locks on ${txnExclusive.size} tables`,
+          file: file.path,
+          line: txnExclusiveLine,
+          statement: [...txnExclusive].slice(0, 5).join(", "),
+          explanation: "All these locks are held until the transaction commits. Touching several hot tables in one transaction multiplies the blast radius (everything stays locked while later statements run) and is a classic deadlock recipe against concurrent traffic.",
+          safeHint: "Split into one migration (or one transaction) per table, each as short as possible, each with lock_timeout set."
+        });
+      }
+      txnExclusive = /* @__PURE__ */ new Set();
+    };
+    for (const { stmt, info: info2 } of parsed) {
       statements++;
-      const info2 = parseStatement(stmt.text, stmt.line);
-      if (info2.kind === "begin") {
-        inExplicitTxn = true;
-        sawExplicitTxn = true;
-        continue;
-      }
-      if (info2.kind === "commit") {
-        inExplicitTxn = false;
-        continue;
-      }
-      if (info2.kind === "set" && info2.setParam?.name.endsWith("lock_timeout")) {
-        const v = info2.setParam.value.replace(/'/g, "");
-        if (v !== "0" && v !== "" && v !== "default") lockTimeoutSet = true;
-        continue;
-      }
       const inTransaction = inExplicitTxn || !sawExplicitTxn && opts.assumeTransaction;
+      const addExclusive = (table) => {
+        if (!inTransaction) return;
+        if (txnExclusive.size === 0) txnExclusiveLine = stmt.line;
+        txnExclusive.add(normTableKey(table));
+      };
       if (info2.kind === "alter-table" && info2.table) {
         const takesAE = (info2.actions ?? []).some((a) => a.kind !== "validate-constraint" && a.kind !== "other");
-        if (takesAE) exclusiveTables.add(info2.table);
+        if (takesAE) addExclusive(info2.table);
       }
-      if ((info2.kind === "drop-table" || info2.kind === "truncate" || info2.kind === "lock-table") && info2.table) exclusiveTables.add(info2.table);
+      if ((info2.kind === "drop-table" || info2.kind === "truncate") && info2.table) addExclusive(info2.table);
+      if (info2.kind === "lock-table" && info2.table && (info2.lockMode === void 0 || info2.lockMode === "ACCESS EXCLUSIVE")) addExclusive(info2.table);
       const ctx = {
         stmt,
         info: info2,
@@ -25849,6 +26628,10 @@ function analyzeFiles(files, options = {}) {
         inTransaction,
         explicitTxn: inExplicitTxn,
         lockTimeoutSet,
+        statementTimeoutSet,
+        tableCreatedThisFile,
+        constraintsDroppedThisFile,
+        constraintsAddedThisFile,
         opts,
         tableStats: (t) => lookupStats(opts.snapshot, t),
         report: (f) => {
@@ -25866,32 +26649,64 @@ function analyzeFiles(files, options = {}) {
         } catch {
         }
       }
-    }
-    if (exclusiveTables.size >= 3) {
-      const inTxn = sawExplicitTxn || opts.assumeTransaction;
-      if (inTxn) {
-        findings.push({
-          ruleId: "many-exclusive-locks-one-transaction",
-          severity: "warning",
-          title: `This migration takes exclusive locks on ${exclusiveTables.size} tables in one transaction`,
-          file: file.path,
-          line: 1,
-          statement: [...exclusiveTables].slice(0, 5).join(", "),
-          explanation: "All locks are held until COMMIT. Touching several hot tables in one transaction multiplies the blast radius (everything stays locked while later statements run) and is a classic deadlock recipe against concurrent traffic.",
-          safeHint: "Split into one migration per table, each as short as possible, each with lock_timeout set."
-        });
+      if (info2.kind === "begin") {
+        flushMultiLock();
+        inExplicitTxn = true;
+        sawExplicitTxn = true;
+        openLine = stmt.line;
+        openText = excerpt(stmt.text);
+        openedByChain = false;
+        openedByRollbackChain = false;
+      } else if (info2.kind === "commit") {
+        flushMultiLock();
+        if (info2.chain) {
+          inExplicitTxn = true;
+          sawExplicitTxn = true;
+          openLine = stmt.line;
+          openText = excerpt(stmt.text);
+          openedByChain = true;
+          openedByRollbackChain = !!info2.chainRollback;
+        } else {
+          inExplicitTxn = false;
+        }
+      } else if (info2.kind === "set" && info2.setParam) {
+        const v = info2.setParam.value.replace(/'/g, "");
+        const armed = v !== "0" && v !== "" && v !== "default";
+        if (armed && info2.setParam.name === "lock_timeout") lockTimeoutSet = true;
+        if (armed && info2.setParam.name === "statement_timeout") statementTimeoutSet = true;
       }
     }
+    if (inExplicitTxn) {
+      findings.push({
+        ruleId: "uncommitted-transaction",
+        severity: "warning",
+        title: openedByChain ? "A transaction reopened by AND CHAIN is never committed" : "BEGIN without a matching COMMIT \u2014 these changes may never actually apply",
+        file: file.path,
+        line: openLine,
+        statement: openText,
+        explanation: openedByRollbackChain ? "A ROLLBACK ... AND CHAIN discarded everything in the prior transaction and immediately opened a NEW transaction that this file never closes. The rolled-back statements did NOT persist, and anything after the AND CHAIN runs in a transaction that is itself rolled back when the session ends \u2014 with its locks held until then." : openedByChain ? "A COMMIT ... AND CHAIN committed the prior work and immediately opened a NEW transaction that this file never closes. The earlier statements are durable, but everything after the AND CHAIN runs in a transaction that is rolled back when the session ends \u2014 and its locks are held until then." : "This file opens a transaction and never commits it. The migration can report success while the open transaction is rolled back when the session ends \u2014 the changes silently vanish, and every lock it took was held for nothing.",
+        safeHint: openedByChain ? "Close the chained transaction with a final COMMIT; (or drop the AND CHAIN)." : "End the file with COMMIT; (or remove the BEGIN and let your migration runner manage the transaction)."
+      });
+    }
+    flushMultiLock();
   }
-  const seenLockTimeoutFile = /* @__PURE__ */ new Set();
+  const oncePerFile = /* @__PURE__ */ new Set(["no-lock-timeout", "no-statement-timeout", "unqualified-table-name"]);
+  const seenPerFile = /* @__PURE__ */ new Set();
   const deduped = findings.filter((f) => {
-    if (f.ruleId !== "no-lock-timeout") return true;
-    if (seenLockTimeoutFile.has(f.file)) return false;
-    seenLockTimeoutFile.add(f.file);
+    if (!oncePerFile.has(f.ruleId)) return true;
+    const key = `${f.ruleId}\0${f.file}`;
+    if (seenPerFile.has(key)) return false;
+    seenPerFile.add(key);
     return true;
   });
   findings.length = 0;
   findings.push(...deduped);
+  if (opts.ignoreRules && opts.ignoreRules.length > 0) {
+    const ignored = new Set(opts.ignoreRules);
+    const kept = findings.filter((f) => !ignored.has(f.ruleId));
+    findings.length = 0;
+    findings.push(...kept);
+  }
   for (const f of findings) {
     if (f.rewrite && !opts.pro) {
       f.rewriteAvailable = true;
@@ -26692,6 +27507,7 @@ async function run() {
   const wantComment = (core.getInput("comment") || "true").trim() !== "false";
   const proUrl = resolveProUrl(core.getInput("pro-url"));
   const token = core.getInput("github-token") || process.env.GITHUB_TOKEN || "";
+  const ignoreRules = core.getInput("ignore-rules").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
   if (!["critical", "warning", "never"].includes(localFailOn)) {
     throw new Error(`Invalid fail-on value "${localFailOn}" \u2014 use 'critical', 'warning', or 'never'.`);
   }
@@ -26749,8 +27565,10 @@ async function run() {
     pgVersion,
     assumeTransaction,
     snapshot,
-    pro: license.pro
+    pro: license.pro,
+    ignoreRules
   });
+  if (ignoreRules.length > 0) core.info(`Ignoring rule(s): ${ignoreRules.join(", ")}`);
   let markdown = renderMarkdown(report, { proUrl });
   const note = frameworkNote(frameworkFiles);
   if (note) markdown += `

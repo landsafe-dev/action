@@ -7,7 +7,7 @@ Every rule is **advisory**: Landsafe warns, a human merges.
 **What each tier adds, per finding:**
 
 - **Free** — every rule below fires, with the full explanation, the lock profile (which lock, what it blocks), and the safe pattern in prose. Unlimited repos, unlimited developers. Detection is not the paid part.
-- **Pro** ($79/mo, unlimited repos and developers) — findings additionally include the **ready-to-paste zero-downtime rewrite** (multi-step SQL with per-step notes and honest caveats), and — when you provide a schema snapshot — **impact estimates against your real table sizes** (a `SET NOT NULL` validation scan of a 48M-row, 6.2 GB `users` table: "~12 s–62 s for 48.0M rows (6.2 GB)"). Estimates are deliberately conservative ranges, never fake precision.
+- **Pro** ($79/mo, unlimited repos and developers) — findings additionally include the **ready-to-paste zero-downtime rewrite** (multi-step SQL with per-step notes and honest caveats), and, when you provide a schema snapshot, **impact estimates against your real table sizes** (a `SET NOT NULL` validation scan of a 48M-row, 6.2 GB `users` table: "~12 s–62 s for 48.0M rows (6.2 GB)"). Estimates are deliberately conservative ranges, never fake precision.
 - **Business** ($299/mo, unlimited repos and developers) — everything in Pro. Doesn't change what a finding says. Adds org-wide policy enforcement (a license-encoded fail-on threshold that individual repos can tighten but never loosen), the weekly cross-repo digest, and the cross-repo dashboard: trends, audit view, and the log of PRs that merged with criticals unresolved.
 
 Full pricing and the tier table live in the [README](../README.md#pricing).
@@ -36,6 +36,9 @@ Full pricing and the tier table live in the [README](../README.md#pricing).
 | [`check-without-not-valid`](#check-without-not-valid) | critical | ACCESS EXCLUSIVE (scan) | ✅ |
 | [`unique-constraint-direct`](#unique-constraint-direct) | critical | ACCESS EXCLUSIVE (index build) | ✅ |
 | [`add-primary-key-direct`](#add-primary-key-direct) | critical | ACCESS EXCLUSIVE (index build) | ✅ |
+| [`exclude-constraint-blocking`](#exclude-constraint-blocking) | critical | ACCESS EXCLUSIVE (index build) | — |
+| [`domain-constraint`](#domain-constraint) | critical / info | database-wide validation scan | — |
+| [`create-trigger-lock`](#create-trigger-lock) | warning | SHARE ROW EXCLUSIVE | — |
 | [`vacuum-full`](#vacuum-full) | critical | ACCESS EXCLUSIVE (rewrite) | — |
 | [`explicit-lock-table`](#explicit-lock-table) | warning | ACCESS EXCLUSIVE | — |
 | [`detach-partition-blocking`](#detach-partition-blocking) | critical | ACCESS EXCLUSIVE (parent table) | ✅ (PG 14+) |
@@ -46,14 +49,27 @@ Full pricing and the tier table live in the [README](../README.md#pricing).
 | [`rename-breaks-code`](#rename-breaks-code) | warning | ACCESS EXCLUSIVE (instant) | ✅ |
 | [`unbounded-update-delete`](#unbounded-update-delete) | critical | row locks until commit | ✅ |
 | [`drop-database`](#drop-database) | critical | — | — |
-| [`no-lock-timeout`](#no-lock-timeout) | warning | — | ✅ |
+| [`drop-not-null`](#drop-not-null) | warning | ACCESS EXCLUSIVE (instant) | — |
+| [`drop-constraint-lock`](#drop-constraint-lock) | warning | ACCESS EXCLUSIVE (both tables for FKs) | — |
+| [`enum-value-rename`](#enum-value-rename) | warning | — | — |
+| [`add-identity-existing-column`](#add-identity-existing-column) | warning | ACCESS EXCLUSIVE (instant) | — |
+| [`transaction-nesting`](#transaction-nesting) | warning | — | — |
+| [`prefer-robust-statements`](#prefer-robust-statements) | info | — | — |
+| [`unrecognized-statement`](#unrecognized-statement) | info | — | — |
+| [`no-lock-timeout`](#no-lock-timeout) | warning | — | — |
+| [`no-statement-timeout`](#no-statement-timeout) | info | — | — |
 | [`enum-add-value-in-transaction`](#enum-add-value-in-transaction) | critical (PG < 12) / info (PG 12+) | — | — |
+| [`enum-value-ordering`](#enum-value-ordering) | info | — | — |
+| [`identifier-too-long`](#identifier-too-long) | warning | — | — |
+| [`unqualified-table-name`](#unqualified-table-name) | info | — | — |
 | [`prefer-bigint-pk`](#prefer-bigint-pk) | info | — | — |
 | [`prefer-identity-over-serial`](#prefer-identity-over-serial) | info | — | — |
 | [`prefer-timestamptz`](#prefer-timestamptz) | info | — | — |
 | [`ban-char-n`](#ban-char-n) | info | — | — |
+| [`prefer-text`](#prefer-text) | info | — | — |
+| [`prefer-jsonb`](#prefer-jsonb) | info | — | — |
 
-Landsafe also runs one **cross-statement check** over each whole migration file: [`many-exclusive-locks-one-transaction`](#many-exclusive-locks-one-transaction).
+Landsafe also runs two **cross-statement checks** over each whole migration file: [`many-exclusive-locks-one-transaction`](#many-exclusive-locks-one-transaction) and [`uncommitted-transaction`](#uncommitted-transaction).
 
 ---
 
@@ -83,7 +99,7 @@ Landsafe also runs one **cross-statement check** over each whole migration file:
 
 **Severity: 🔴 critical**
 
-**Detects:** `ALTER TABLE ... ADD COLUMN ... NOT NULL` with no `DEFAULT`.
+**Detects:** `ALTER TABLE ... ADD COLUMN ... NOT NULL` with no `DEFAULT` — including an inline `PRIMARY KEY` column, which implies `NOT NULL`.
 
 **Why it's dangerous:** existing rows have no value for the new column, so Postgres rejects the statement outright (`column "..." of relation contains null values`) on any non-empty table. This is the migration that passes in dev (empty table) and explodes in production — and if your migration runner retries or half-applies, you're down.
 
@@ -157,7 +173,7 @@ Landsafe also runs one **cross-statement check** over each whole migration file:
 
 **Severity: 🔴 critical**
 
-**Detects:** `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, or `REINDEX ... CONCURRENTLY` inside a transaction — either an explicit `BEGIN`, or the implicit transaction your migration runner wraps around every file (Landsafe assumes a wrapper by default; configurable).
+**Detects:** `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY`, `REINDEX ... CONCURRENTLY`, or `DETACH PARTITION ... CONCURRENTLY` inside a transaction — either an explicit `BEGIN`, or the implicit transaction your migration runner wraps around every file (Landsafe assumes a wrapper by default; configurable).
 
 **Why it's dangerous:** `CONCURRENTLY` refuses to run inside a transaction block. The migration doesn't lock anything — it simply **fails at deploy time** (`CREATE INDEX CONCURRENTLY cannot run inside a transaction block`), which usually means a broken deploy pipeline at the worst moment.
 
@@ -234,6 +250,42 @@ Landsafe also runs one **cross-statement check** over each whole migration file:
 **Safe pattern:** `CREATE UNIQUE INDEX CONCURRENTLY`, then `ADD CONSTRAINT ... PRIMARY KEY USING INDEX`. Key columns must already be NOT NULL — use the scan-free NOT NULL pattern first if needed.
 
 **Free:** detection + pattern. **Pro:** the paste-ready rewrite plus build duration from your snapshot.
+
+---
+
+### `exclude-constraint-blocking`
+
+**Severity: 🔴 critical**
+
+**Detects:** `ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE`.
+
+**Why it's dangerous:** an exclusion constraint builds its backing (typically GiST) index while holding **ACCESS EXCLUSIVE** — all reads and writes are blocked for the entire build. And unlike every other constraint, Postgres offers **no online escape hatch**: `NOT VALID` is only allowed for foreign key and CHECK constraints, `USING INDEX` adoption only exists for UNIQUE and PRIMARY KEY, and there is no `CONCURRENTLY` variant — on any version.
+
+**Safe pattern:** there isn't one. Plan a maintenance window with `lock_timeout` set. If the exclusion is over plain equality, a unique index (buildable `CONCURRENTLY`) may serve instead.
+
+---
+
+### `domain-constraint`
+
+**Severity: 🔴 critical** (`ALTER DOMAIN ... ADD CONSTRAINT` without `NOT VALID`) **· 🔵 info** (with `NOT VALID`, or `CREATE DOMAIN` with a constraint)
+
+**Detects:** `ALTER DOMAIN ... ADD CONSTRAINT` and `CREATE DOMAIN` with an inline constraint.
+
+**Why it's dangerous:** adding a domain constraint without `NOT VALID` validates **every column of every table using the domain, across the whole database**, before it completes — the cost scales with *all* tables using the domain, not one. A domain used in ten tables means ten validation scans in one statement. `NOT VALID` *is* supported for domain CHECK constraints (then `ALTER DOMAIN ... VALIDATE CONSTRAINT`), with the docs' own caveat that the eager check isn't bulletproof against concurrent writes: commit, wait out older transactions, then validate. `CREATE DOMAIN` with a constraint is instant today but taxes every future migration that touches it — Postgres treats coercion to a constrained domain as requiring a rewrite.
+
+**Safe pattern:** `ADD CONSTRAINT ... NOT VALID` → wait out pre-commit transactions → `VALIDATE CONSTRAINT`. Better: put constraints on columns, not domains.
+
+---
+
+### `create-trigger-lock`
+
+**Severity: 🟡 warning**
+
+**Detects:** `CREATE TRIGGER` / `CREATE CONSTRAINT TRIGGER` on a table not created in the same file.
+
+**Why it's dangerous:** `CREATE TRIGGER` takes **SHARE ROW EXCLUSIVE**: every `INSERT`, `UPDATE`, and `DELETE` blocks until it completes (reads continue). The operation itself is a fast catalog change — the risk is the queue: it must wait behind any long-running write, and every write then queues behind *it*.
+
+**Safe pattern:** `SET lock_timeout = '5s';` first, so a busy table makes it fail fast and retryable instead of freezing writes behind a stuck queue.
 
 ---
 
@@ -373,6 +425,92 @@ Landsafe also runs one **cross-statement check** over each whole migration file:
 
 ---
 
+### `drop-not-null`
+
+**Severity: 🟡 warning**
+
+**Detects:** `ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL`.
+
+**Why it's dangerous:** the drop itself is instant (catalog-only, brief ACCESS EXCLUSIVE). The damage is delayed: application code, PL/pgSQL, and queries written against a never-NULL guarantee start meeting NULLs and fail in ways no test caught. It's also a one-way door in practice — re-adding `NOT NULL` later requires a full-table scan (or the PG 12+ CHECK-constraint dance).
+
+**Safe pattern:** confirm every reader tolerates NULL first. For a temporary relaxation, prefer a CHECK constraint you can VALIDATE back later.
+
+---
+
+### `drop-constraint-lock`
+
+**Severity: 🟡 warning**
+
+**Detects:** `ALTER TABLE ... DROP CONSTRAINT` (except constraints this same file added — the deliberate temp-constraint pattern).
+
+**Why it's dangerous:** dropping a constraint takes a brief **ACCESS EXCLUSIVE** on the table — and if it's a foreign key, Postgres locks the **referenced** table exclusively too. That's the asymmetric surprise: adding an FK takes SHARE ROW EXCLUSIVE, dropping it freezes both tables outright. The integrity guarantee is also gone the moment it commits.
+
+**Safe pattern:** `SET lock_timeout` first; for FK drops treat *both* tables as briefly frozen; make sure nothing still relies on the guarantee.
+
+---
+
+### `enum-value-rename`
+
+**Severity: 🟡 warning**
+
+**Detects:** `ALTER TYPE ... RENAME VALUE`.
+
+**Why it's dangerous:** the rename is metadata-only and transaction-safe (existing rows store the enum internally, not the label) — but every running app instance still *sends* the old label, and those INSERTs/UPDATEs start erroring the instant the rename commits. Under rolling deploys there is always a window where old code runs.
+
+**Safe pattern:** coordinate with an all-at-once deploy, or expand/contract: add the new value, migrate code to write it, then retire the old one.
+
+---
+
+### `add-identity-existing-column`
+
+**Severity: 🟡 warning**
+
+**Detects:** `ALTER TABLE ... ALTER COLUMN ... ADD GENERATED ... AS IDENTITY` on an existing column.
+
+**Why it's dangerous:** the change is catalog-only (no rewrite, brief ACCESS EXCLUSIVE) and existing rows keep their values — but the new sequence **starts at 1, ignoring them**. The statement also errors outright unless the column is already NOT NULL. If rows exist, future inserts draw already-used numbers and die with duplicate-key errors: a delayed production incident no empty test database will ever show.
+
+**Safe pattern:** right after adding the identity, align the sequence: `SELECT setval(pg_get_serial_sequence('t','id'), (SELECT COALESCE(MAX(id),0)+1 FROM t), false);`
+
+---
+
+## Transaction structure and rerunnability
+
+### `transaction-nesting`
+
+**Severity: 🟡 warning**
+
+**Detects:** `BEGIN` while a transaction is already open, and `COMMIT`/`ROLLBACK` with no open explicit transaction. Balanced `BEGIN ... COMMIT` files are treated as self-managed and never fire.
+
+**Why it's dangerous:** Postgres has no nested transactions — a second `BEGIN` is a no-op WARNING, and the next `COMMIT` ends the *outer* transaction, so everything after it runs non-atomically, each statement committing on its own. A bare `COMMIT` in a runner-wrapped file ends the *runner's* transaction early with the same result. The file's transaction structure no longer means what it says.
+
+**Safe pattern:** balance `BEGIN`/`COMMIT` exactly (use `SAVEPOINT` for partial-rollback points), or drop explicit transaction control and let the runner manage it.
+
+---
+
+### `prefer-robust-statements`
+
+**Severity: 🔵 info**
+
+**Detects:** statements that can't be rerun after a partial failure: named `CREATE INDEX CONCURRENTLY` / `DROP INDEX CONCURRENTLY` without `IF [NOT] EXISTS` (anywhere), and — outside a transaction — unguarded `CREATE TABLE`, `CREATE INDEX`, `DROP TABLE/INDEX/TYPE`, `ADD/DROP COLUMN`, `DROP CONSTRAINT`, and `ADD CONSTRAINT` whose name isn't re-added after a same-file drop.
+
+**Why it matters:** a non-transactional migration that fails partway leaves earlier statements applied; the rerun then dies on `already exists` / `does not exist` and the pipeline wedges. The nastiest case is a failed `CREATE INDEX CONCURRENTLY`, which leaves an INVALID index squatting on the name.
+
+**Safe pattern:** `IF [NOT] EXISTS` on every guardable statement; for `ADD CONSTRAINT` (which has no `IF NOT EXISTS`), precede it with `DROP CONSTRAINT IF EXISTS` of the same name. On a failed concurrent build, drop the INVALID index before retrying.
+
+---
+
+### `unrecognized-statement`
+
+**Severity: 🔵 info**
+
+**Detects:** any statement Landsafe's parser could not read — unusual DDL, a syntax error, or a parser gap.
+
+**Why it matters:** a best-effort parser that *silently* skips what it can't read converts every gap into a false negative — a clean bill of health it didn't earn. Landsafe reports what it didn't analyze instead. Recognized-but-deliberately-unanalyzed statements (`GRANT`, `COMMENT`, `CREATE VIEW`, ...) don't fire this; only the genuinely unreadable does.
+
+**Safe pattern:** review the statement manually. If it's valid SQL Landsafe should understand, open an issue with the statement.
+
+---
+
 ## Hygiene and correctness
 
 ### `no-lock-timeout`
@@ -385,7 +523,19 @@ Landsafe also runs one **cross-statement check** over each whole migration file:
 
 **Safe pattern:** start the migration with `SET lock_timeout = '5s';` (and consider `SET statement_timeout`). Retry on failure — it errors cleanly.
 
-**Free:** detection + pattern. **Pro:** the queue-safe preamble as a paste-ready rewrite.
+**Free & Pro: identical.** The one-line `SET lock_timeout` preamble above is the entire fix, so there is nothing to gate behind Pro.
+
+---
+
+### `no-statement-timeout`
+
+**Severity: 🔵 info**
+
+**Detects:** DDL in a file where no `statement_timeout` was set beforehand. Fires once per file.
+
+**Why it matters:** `lock_timeout` bounds how long you *wait* for a lock; `statement_timeout` bounds how long the statement may *run* once it has it. A validation scan or index build that turns out bigger than expected will otherwise hold its locks for as long as it takes.
+
+**Safe pattern:** `SET statement_timeout = '60s';` before the DDL — and keep `lock_timeout` well below it so lock waits still fail first.
 
 ---
 
@@ -401,13 +551,49 @@ Landsafe also runs one **cross-statement check** over each whole migration file:
 
 ---
 
+### `enum-value-ordering`
+
+**Severity: 🔵 info**
+
+**Detects:** `ALTER TYPE ... ADD VALUE` without `BEFORE`/`AFTER`.
+
+**Why it matters:** enum values have a defined order and comparisons like `status < 'approved'` use it. A value appended at the end sorts after everything — if the enum's order is meaningful (workflow stages, severities), order-dependent queries silently change meaning rather than erroring.
+
+**Safe pattern:** state the position explicitly: `ALTER TYPE status ADD VALUE 'pending' BEFORE 'approved';`
+
+---
+
+### `identifier-too-long`
+
+**Severity: 🟡 warning**
+
+**Detects:** any identifier in a statement longer than **63 bytes** (bytes, not characters — Postgres's `NAMEDATALEN - 1` limit).
+
+**Why it matters:** Postgres keeps only the first 63 bytes and says so only in a NOTICE nobody reads in CI. The name you wrote is not the name Postgres uses — later references can miss it, and two long names sharing a 63-byte prefix silently collapse into the *same* object, so DDL hits the wrong one. ORM-generated index and constraint names are the usual culprits.
+
+**Safe pattern:** shorten the name (override your ORM's generated index/constraint names).
+
+---
+
+### `unqualified-table-name`
+
+**Severity: 🔵 info**
+
+**Detects:** `CREATE TABLE`, `ALTER TABLE`, or `DROP TABLE` whose table name has no schema qualifier (TEMP tables exempt). Reported once per file.
+
+**Why it matters:** without an explicit schema, Postgres resolves the name through `search_path` at run time — *which table the statement touches* depends on session configuration, not on the migration text.
+
+**Safe pattern:** write `schema.table` (e.g. `public.users`) in DDL. Teams that standardize on `search_path` instead can mute this: `--ignore unqualified-table-name` (CLI) or `ignore-rules: unqualified-table-name` (Action).
+
+---
+
 ### `prefer-bigint-pk`
 
 **Severity: 🔵 info**
 
-**Detects:** `CREATE TABLE` with a 32-bit primary key (`integer`, `int4`, `serial`).
+**Detects:** `CREATE TABLE` with a 16- or 32-bit primary key (`smallint`, `int2`, `smallserial`, `serial2`, `integer`, `int4`, `serial`, `serial4`), and `ADD COLUMN` with a narrow `serial` type (sequences only count up — total inserts ever, not live rows, is the ceiling).
 
-**Why it matters:** `int4` tops out at ~2.1 billion. Busy tables hit it — Basecamp, Sentry, and plenty of others have written the postmortem — and the emergency `int → bigint` migration on a huge table is exactly the rewrite nightmare Landsafe exists to prevent. Starting with `bigint` costs nothing today.
+**Why it matters:** `int4` tops out at ~2.1 billion (`smallint` at 32,767). Busy tables hit it — Basecamp, Sentry, and plenty of others have written the postmortem — and the emergency `int → bigint` migration on a huge table is exactly the rewrite nightmare Landsafe exists to prevent. Starting with `bigint` costs nothing today.
 
 **Safe pattern:** `BIGINT GENERATED ALWAYS AS IDENTITY` (or `bigserial`) for primary keys.
 
@@ -449,17 +635,53 @@ Landsafe also runs one **cross-statement check** over each whole migration file:
 
 ---
 
+### `prefer-text`
+
+**Severity: 🔵 info**
+
+**Detects:** `varchar(n)` / `character varying(n)` columns in `CREATE TABLE`, `ADD COLUMN`, or `ALTER COLUMN TYPE`. Bare `varchar` (no length) is equivalent to `text` and doesn't fire.
+
+**Why it matters:** `varchar(n)` hard-codes a limit into the schema. Raising it later is catalog-only (since PG 9.2) but still takes a brief ACCESS EXCLUSIVE plus a deploy; *shrinking* it rewrites the whole table and its indexes. `text` with a CHECK constraint enforces the same limit and changes online via `NOT VALID` → `VALIDATE`.
+
+**Safe pattern:** `text` plus `CHECK (length(col) <= n)`, added `NOT VALID` then validated.
+
+---
+
+### `prefer-jsonb`
+
+**Severity: 🔵 info**
+
+**Detects:** `json` columns in `CREATE TABLE` or `ADD COLUMN`.
+
+**Why it matters:** `json` stores the exact input text and reparses it on every operation; it can't be GIN-indexed. `jsonb` stores decomposed binary — slightly slower to write, significantly faster to query, and indexable. The Postgres docs themselves recommend `jsonb` for most applications.
+
+**Safe pattern:** `jsonb`, unless you specifically need byte-exact round-tripping (key order, duplicate keys, whitespace).
+
+---
+
 ## Cross-statement analysis
 
 ### `many-exclusive-locks-one-transaction`
 
 **Severity: 🟡 warning**
 
-**Detects:** a single transactional migration that takes exclusive locks on **three or more distinct tables** (`ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, `LOCK TABLE` targets). This check runs across the whole file, not per statement.
+**Detects:** a single transaction that takes exclusive locks on **three or more distinct tables** (`ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, `LOCK TABLE` targets). Scoped per transaction: locks isolated in their own `BEGIN`/`COMMIT` (or under autocommit) are never held together and don't count.
 
 **Why it's dangerous:** all locks are held until `COMMIT`. Touching several hot tables in one transaction multiplies the blast radius — everything stays locked while later statements run — and is a classic deadlock recipe against concurrent traffic.
 
 **Safe pattern:** split into one migration per table, each as short as possible, each with `lock_timeout` set.
+
+---
+
+### `uncommitted-transaction`
+
+**Severity: 🟡 warning**
+
+**Detects:** a file that opens `BEGIN` and never commits it. Runs across the whole file; anchored on the dangling `BEGIN`.
+
+**Why it's dangerous:** the migration can report success while the open transaction is rolled back when the session ends — the changes silently vanish, and every lock it took was held for nothing.
+
+**Safe pattern:** end the file with `COMMIT;`, or remove the `BEGIN` and let the runner manage the transaction.
 
 ---
 
