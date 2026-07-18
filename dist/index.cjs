@@ -26831,6 +26831,9 @@ function renderMarkdown(report, opts = {}) {
       );
     }
     F.push("---", "", `<sub>\u{1F6EC} [Landsafe](https://landsafe.dev) v${report.engineVersion} \xB7 Postgres migration safety \xB7 advisory-only, a human always merges</sub>`);
+    if (!report.pro) {
+      F.push("", `**Found this useful?** [Add Landsafe to your repo \u2192](https://landsafe.dev/#quickstart)`);
+    }
     F.push("", encodePayload(buildPayload(report, opts.now ?? /* @__PURE__ */ new Date())));
     return F.join("\n");
   };

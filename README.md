@@ -36,6 +36,14 @@ jobs:
 
 That's it. The Action never connects to your database. It holds no credentials, installs no agent, and needs no schema-as-code migration — it reads the `.sql` files out of the PR diff and nothing else.
 
+Once it's running, tell people:
+
+```md
+[![Checked with Landsafe](https://img.shields.io/badge/checked%20with-Landsafe-brightgreen)](https://landsafe.dev)
+```
+
+[![Checked with Landsafe](https://img.shields.io/badge/checked%20with-Landsafe-brightgreen)](https://landsafe.dev)
+
 ## What lands on the PR
 
 One sticky comment, updated in place, never spammed:
@@ -57,6 +65,8 @@ One sticky comment, updated in place, never spammed:
 44 rules covering blocking index builds, full-table rewrites, validation scans under exclusive locks, lock-queue pileups, data loss, rolling-deploy breakage, and migrations that simply error at deploy time. Every one is version-aware: PG 11's fast defaults, PG 12's scan-free `SET NOT NULL`, `REINDEX CONCURRENTLY`, `DETACH PARTITION CONCURRENTLY` in 14. [Full rule reference →](https://github.com/landsafe-dev/action/blob/main/docs/RULES.md)
 
 **It's advisory about merging, honest about signalling.** By default the check goes red on a critical finding — you'll see a failing check, and you can merge straight through it. Landsafe never holds a required status, never blocks a merge, and never touches your database. Want it purely informational? `fail-on: never`.
+
+Free-tier comments carry one footer line inviting whoever's reading the PR to add Landsafe to their own repo. Pro and Business comments drop it — a clean comment is part of what paying for it buys.
 
 ## Why you should trust an Action you've never heard of
 
