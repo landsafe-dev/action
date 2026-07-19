@@ -136,11 +136,10 @@ npx landsafe mcp      # MCP server over stdio — check_migration, list_rules
 
 Same engine, same rules, same answers as CI — so an agent can't get a verdict locally that the PR check later contradicts.
 
-## Limits, stated plainly
+## Limits
 
 - **Postgres only.** I'd rather be right about one database than vague about five. No MySQL, no SQLite.
 - **It reads SQL.** Rails/Django/Prisma migrations written in Ruby/Python/TypeScript aren't analyzed — only the `.sql` they generate.
-- **It's new.** No pretending otherwise.
 
 ## About this repo
 
