@@ -178,6 +178,11 @@ async function run(): Promise<void> {
   const wantComment = (core.getInput('comment') || 'true').trim() !== 'false';
   const proUrl = resolveProUrl(core.getInput('pro-url'));
   const token = core.getInput('github-token') || process.env.GITHUB_TOKEN || '';
+  const ignoreRules = core
+    .getInput('ignore-rules')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 
   if (!['critical', 'warning', 'never'].includes(localFailOn)) {
     throw new Error(`Invalid fail-on value "${localFailOn}" — use 'critical', 'warning', or 'never'.`);
@@ -252,7 +257,9 @@ async function run(): Promise<void> {
     assumeTransaction,
     snapshot,
     pro: license.pro,
+    ignoreRules,
   });
+  if (ignoreRules.length > 0) core.info(`Ignoring rule(s): ${ignoreRules.join(', ')}`);
 
   let markdown = renderMarkdown(report, { proUrl });
   const note = frameworkNote(frameworkFiles);

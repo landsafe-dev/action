@@ -24246,6 +24246,11 @@ var VOLATILE_FNS = [
   "RANDOM_NORMAL",
   "GEN_RANDOM_UUID",
   "GEN_RANDOM_BYTES",
+  // PG 18 added uuidv4()/uuidv7() as core spellings alongside gen_random_uuid().
+  // Both are provolatile = 'v'; without them a PG 18 `DEFAULT uuidv7()` reads as a
+  // safe default and the rewrite goes unreported — a false negative, not a false alarm.
+  "UUIDV4",
+  "UUIDV7",
   // uuid-ossp: v1/v1mc mix the clock with a (random, for v1mc) node id; v4 is random. v3/v5
   // are deterministic hashes (IMMUTABLE) and are deliberately absent.
   "UUID_GENERATE_V1",

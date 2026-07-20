@@ -81,7 +81,7 @@ Landsafe also runs two **cross-statement checks** over each whole migration file
 
 **Detects:** `ALTER TABLE ... ADD COLUMN` where the new column forces a physical table rewrite:
 
-- a **volatile** default (`clock_timestamp()`, `random()`, `gen_random_uuid()`, `uuid_generate_v4()`, `nextval()`, …) on **any** Postgres version;
+- a **volatile** default (`clock_timestamp()`, `random()`, `gen_random_uuid()`, PG 18's `uuidv4()` / `uuidv7()`, `uuid_generate_v4()`, `nextval()`, …) on **any** Postgres version;
 - any default on **PG < 11**;
 - a `serial`/`bigserial` column (implicit `DEFAULT nextval(...)` — volatile), an **IDENTITY** column, or a **`GENERATED ... STORED`** column — these rewrite the table on **every** version, including 11+.
 
